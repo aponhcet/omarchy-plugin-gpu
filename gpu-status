@@ -5,7 +5,9 @@
 # choice here does not move the running session.
 #
 # "brief" is safe to poll: it does not call nvidia-smi, which wakes the
-# discrete GPU. "status" adds names and NVIDIA power, for the open panel.
+# discrete GPU, and it does not inspect apps. "status" adds names, NVIDIA
+# power, and the app list for the open panel. "set-app" remembers Desktop,
+# Intel, or NVIDIA for the next start of one program.
 #
 # Tests inject GPU_STATUS_* instead of reading this machine. They must set
 # XDG_CONFIG_HOME, or "set" would write the real login preference.
@@ -108,6 +110,554 @@ write_preference() {
     return 1
   fi
   mv -f "$tmp" "$file"
+}
+
+apps_file() {
+  local config_home=${XDG_CONFIG_HOME:-$HOME/.config}
+  printf '%s\n' "$config_home/uwsm/gpu-apps"
+}
+
+data_root() {
+  printf '%s' "${XDG_DATA_HOME:-$HOME/.local/share}"
+}
+
+plugin_dir() {
+  dirname "$(readlink -f "$0")"
+}
+
+plugin_launch() {
+  printf '%s' "$(plugin_dir)/gpu-launch"
+}
+
+unsafe_path() {
+  [[ -z ${1:-} || $1 == *" "* || $1 == *$'\n'* || $1 == *$'\t'* ]]
+}
+
+valid_app_id() {
+  [[ ${1:-} =~ ^[a-z0-9][a-z0-9._+-]{0,40}$ ]]
+}
+
+comm_id() {
+  local name=${1%.exe}
+  name=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')
+  printf '%s' "$name"
+}
+
+# Tests set GPU_STATUS_BIN_DIR and must not fall through to this machine.
+resolve_bin() {
+  local id=$1 candidate dir
+  if [[ -n ${GPU_STATUS_BIN_DIR+x} ]]; then
+    candidate=${GPU_STATUS_BIN_DIR}/$id
+    if [[ -x $candidate && ! -d $candidate ]] && ! unsafe_path "$candidate"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+    return 1
+  fi
+  for dir in /usr/local/bin /usr/bin; do
+    candidate=$dir/$id
+    [[ -x $candidate && ! -d $candidate ]] || continue
+    printf '%s' "$candidate"
+    return 0
+  done
+  return 1
+}
+
+desktop_source_dir() {
+  if [[ -n ${GPU_STATUS_DESKTOP_DIR+x} ]]; then
+    printf '%s' "$GPU_STATUS_DESKTOP_DIR"
+  else
+    printf '%s' /usr/share/applications
+  fi
+}
+
+wrapper_path() {
+  printf '%s' "$(data_root)/aponhcet.gpu/bin/$1"
+}
+
+desktop_dest() {
+  printf '%s' "$(data_root)/applications/$1.desktop"
+}
+
+wrapper_is_ours() {
+  local path=$1 id=$2
+  [[ -f $path && ! -L $path ]] || return 1
+  grep -q -F "# aponhcet.gpu wrapper $id" "$path"
+}
+
+rewrite_exec_line() {
+  local line=$1 id=$2 wrapper=$3
+  local key rest token args base
+  line=${line%$'\r'}
+  case $line in
+    Exec=* | TryExec=*) ;;
+    *)
+      printf '%s\n' "$line"
+      return 0
+      ;;
+  esac
+  key=${line%%=*}
+  rest=${line#*=}
+  token=$rest
+  args=""
+  if [[ $rest == *" "* ]]; then
+    token=${rest%% *}
+    args=${rest#* }
+  fi
+  [[ -n $token ]] || {
+    printf '%s\n' "$line"
+    return 0
+  }
+  base=$(basename -- "$token")
+  if [[ $base != "$id" ]]; then
+    printf '%s\n' "$line"
+    return 0
+  fi
+  if [[ -n $args ]]; then
+    printf '%s=%s %s\n' "$key" "$wrapper" "$args"
+  else
+    printf '%s=%s\n' "$key" "$wrapper"
+  fi
+}
+
+# 0 written, 2 no menu entry, 3 a desktop file we did not create.
+write_desktop() {
+  local id=$1 wrapper=$2
+  local src dest dir tmp line
+  src=$(desktop_source_dir)/$id.desktop
+  [[ -f $src && ! -L $src ]] || return 2
+  dest=$(desktop_dest "$id")
+  if [[ -e $dest || -L $dest ]]; then
+    if [[ -L $dest || ! -f $dest ]]; then
+      return 3
+    fi
+    if ! grep -q '^X-AponhcetGpu=1$' "$dest"; then
+      return 3
+    fi
+  fi
+  dir=$(dirname "$dest")
+  mkdir -p "$dir"
+  tmp=$(mktemp "$dir/.desktop.XXXXXX")
+  while IFS= read -r line || [[ -n $line ]]; do
+    rewrite_exec_line "$line" "$id" "$wrapper"
+  done <"$src" >"$tmp"
+  if ! grep -q '^X-AponhcetGpu=1$' "$tmp"; then
+    printf 'X-AponhcetGpu=1\n' >>"$tmp"
+  fi
+  chmod 644 "$tmp"
+  mv -f "$tmp" "$dest"
+}
+
+write_wrapper() {
+  local id=$1
+  local root path dir tmp launcher
+  root=$(data_root)
+  launcher=$(plugin_launch)
+  if unsafe_path "$root" || unsafe_path "$launcher" || [[ ! -x $launcher ]]; then
+    echo "gpu-status: launcher path is not usable" >&2
+    return 1
+  fi
+  path=$(wrapper_path "$id")
+  if [[ -e $path ]] && ! wrapper_is_ours "$path" "$id"; then
+    echo "gpu-status: $path already exists" >&2
+    return 1
+  fi
+  dir=$(dirname "$path")
+  mkdir -p "$dir"
+  tmp=$(mktemp "$dir/.wrapper.XXXXXX")
+  {
+    printf '%s\n' '#!/bin/bash'
+    printf '# aponhcet.gpu wrapper %s\n' "$id"
+    printf 'exec %q %q "$@"\n' "$launcher" "$id"
+  } >"$tmp"
+  chmod 755 "$tmp"
+  mv -f "$tmp" "$path"
+  printf '%s' "$path"
+}
+
+each_pin_line() {
+  local file line
+  file=$(apps_file)
+  [[ -f $file ]] || return 0
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ ^([a-z0-9][a-z0-9._+-]{0,40})[[:space:]]+(intel|nvidia)[[:space:]]+(/[^[:space:]]+)[[:space:]]+([^[:space:]]+)$ ]] || continue
+    printf '%s\n' "$line"
+  done <"$file"
+}
+
+save_pref_line() {
+  local id=$1 mode=$2 binary=$3 desktop=$4
+  local file dir tmp line
+  file=$(apps_file)
+  dir=$(dirname "$file")
+  mkdir -p "$dir"
+  tmp=$(mktemp "$dir/.gpu-apps.XXXXXX")
+  while IFS= read -r line; do
+    [[ $line == "$id "* ]] && continue
+    printf '%s\n' "$line"
+  done < <(each_pin_line) >"$tmp"
+  printf '%s %s %s %s\n' "$id" "$mode" "$binary" "$desktop" >>"$tmp"
+  mv -f "$tmp" "$file"
+}
+
+delete_pref_line() {
+  local id=$1
+  local file dir tmp line
+  file=$(apps_file)
+  [[ -f $file ]] || return 0
+  dir=$(dirname "$file")
+  tmp=$(mktemp "$dir/.gpu-apps.XXXXXX")
+  while IFS= read -r line; do
+    [[ $line == "$id "* ]] && continue
+    printf '%s\n' "$line"
+  done < <(each_pin_line) >"$tmp"
+  if [[ -s $tmp ]]; then
+    mv -f "$tmp" "$file"
+  else
+    rm -f "$tmp" "$file"
+  fi
+}
+
+remove_app_pin() {
+  local id=$1 dest wrapper
+  dest=$(desktop_dest "$id")
+  if [[ -f $dest && ! -L $dest ]] && grep -q '^X-AponhcetGpu=1$' "$dest"; then
+    rm -f "$dest"
+  fi
+  wrapper=$(wrapper_path "$id")
+  if wrapper_is_ours "$wrapper" "$id"; then
+    rm -f "$wrapper"
+  fi
+  delete_pref_line "$id"
+}
+
+lookup_pin() {
+  local want=$1 line
+  pin_mode=desktop
+  pin_binary=""
+  pin_desktop="-"
+  while IFS= read -r line; do
+    [[ $line =~ ^([a-z0-9][a-z0-9._+-]{0,40})[[:space:]]+(intel|nvidia)[[:space:]]+(/[^[:space:]]+)[[:space:]]+([^[:space:]]+)$ ]] || continue
+    [[ ${BASH_REMATCH[1]} == "$want" ]] || continue
+    pin_mode=${BASH_REMATCH[2]}
+    pin_binary=${BASH_REMATCH[3]}
+    pin_desktop=${BASH_REMATCH[4]}
+    return 0
+  done < <(each_pin_line)
+}
+
+set_app() {
+  local id=$1 mode=$2 binary wrapper desktop_name wrote
+  valid_app_id "$id" || {
+    echo "gpu-status: bad app id" >&2
+    return 2
+  }
+  case $mode in
+    desktop | intel | nvidia) ;;
+    *)
+      echo "gpu-status: app mode must be desktop, intel, or nvidia" >&2
+      return 2
+      ;;
+  esac
+  if [[ $mode == desktop ]]; then
+    remove_app_pin "$id"
+    return 0
+  fi
+  binary=$(resolve_bin "$id" || true)
+  if [[ -z $binary ]] || unsafe_path "$binary"; then
+    echo "gpu-status: no program for $id" >&2
+    return 1
+  fi
+  case $binary in
+    "$(data_root)/aponhcet.gpu/bin/"*)
+      echo "gpu-status: refusing to wrap the wrapper" >&2
+      return 1
+      ;;
+  esac
+  wrapper=$(write_wrapper "$id")
+  desktop_name="-"
+  wrote=0
+  if write_desktop "$id" "$wrapper"; then
+    wrote=1
+    desktop_name=$id.desktop
+  fi
+  save_pref_line "$id" "$mode" "$binary" "$desktop_name"
+  [[ $wrote == 1 ]] || true
+}
+
+proc_comm() {
+  local text
+  text=$(cat "/proc/$1/comm" 2>/dev/null) || return 1
+  printf '%s' "${text//$'\n'/}"
+}
+
+skip_app_comm() {
+  case $1 in
+    Hyprland | Xwayland | quickshell | wireplumber | pipewire | pipewire-pulse | systemd | dbus-broker | dbus-daemon | nvidia-smi | gpu-status)
+      return 0
+      ;;
+    xdg-desktop-por* | omarchy-launch*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+app_label() {
+  local name=$1 first rest
+  name=${name%.exe}
+  name=$(clean_name "$name")
+  name=${name//%/}
+  [[ -n $name ]] || return 0
+  first=${name:0:1}
+  rest=${name:1}
+  case $first in
+    [a-z]) first=${first^} ;;
+  esac
+  printf '%s' "$first$rest"
+}
+
+add_app() {
+  local id=$1 name=$2 gpu=$3 count existing
+  [[ -n $name ]] || return 0
+  case $gpu in
+    intel | nvidia | both | none) ;;
+    *) return 0 ;;
+  esac
+  valid_app_id "$id" || id=""
+  if [[ -n $id ]]; then
+    existing=$(jq -r --arg id "$id" 'map(select(.id == $id)) | .[0].gpu // ""' <<<"$apps_json")
+  else
+    existing=$(jq -r --arg name "$name" 'map(select(.id == "" and .name == $name)) | .[0].gpu // ""' <<<"$apps_json")
+  fi
+  if [[ -n $existing ]]; then
+    if [[ $existing != "$gpu" ]]; then
+      if [[ $existing == none ]]; then
+        :
+      elif [[ $gpu == none ]]; then
+        gpu=$existing
+      else
+        gpu=both
+      fi
+    fi
+    if [[ -n $id ]]; then
+      apps_json=$(jq -c --arg id "$id" --arg gpu "$gpu" \
+        'map(if .id == $id then .gpu = $gpu else . end)' <<<"$apps_json")
+    else
+      apps_json=$(jq -c --arg name "$name" --arg gpu "$gpu" \
+        'map(if .id == "" and .name == $name then .gpu = $gpu else . end)' <<<"$apps_json")
+    fi
+    return 0
+  fi
+  count=$(jq 'length' <<<"$apps_json")
+  [[ $count -ge 8 ]] && return 0
+  apps_json=$(jq -c --arg id "$id" --arg name "$name" --arg gpu "$gpu" \
+    '. + [{id:$id, name:$name, gpu:$gpu}]' <<<"$apps_json")
+}
+
+merge_saved_apps() {
+  local line id label
+  while IFS= read -r line; do
+    [[ $line =~ ^([a-z0-9][a-z0-9._+-]{0,40})[[:space:]]+(intel|nvidia)[[:space:]]+ ]] || continue
+    id=${BASH_REMATCH[1]}
+    if jq -e --arg id "$id" 'any(.[]; .id == $id)' <<<"$apps_json" >/dev/null; then
+      continue
+    fi
+    label=$(app_label "$id")
+    [[ -n $label ]] || label=$id
+    add_app "$id" "$label" none
+  done < <(each_pin_line)
+}
+
+annotate_apps() {
+  local row id name gpu launchable attached dest out stored
+  out='[]'
+  while IFS= read -r row; do
+    [[ -n $row ]] || continue
+    id=$(jq -r '.id // ""' <<<"$row")
+    name=$(jq -r '.name // ""' <<<"$row")
+    gpu=$(jq -r '.gpu // ""' <<<"$row")
+    lookup_pin "$id"
+    launchable=false
+    stored=$pin_binary
+    if [[ -n $stored && -x $stored && ! -d $stored ]] && ! unsafe_path "$stored"; then
+      launchable=true
+    elif resolve_bin "$id" >/dev/null 2>&1; then
+      launchable=true
+    fi
+    attached=false
+    dest=$(desktop_dest "$id")
+    if [[ -f $dest && ! -L $dest ]] && grep -q '^X-AponhcetGpu=1$' "$dest"; then
+      attached=true
+    fi
+    out=$(jq -c \
+      --arg id "$id" \
+      --arg name "$name" \
+      --arg gpu "$gpu" \
+      --arg preference "$pin_mode" \
+      --argjson launchable "$launchable" \
+      --argjson attached "$attached" \
+      '. + [{id:$id, name:$name, gpu:$gpu, preference:$preference, launchable:$launchable, attached:$attached}]' <<<"$out")
+  done < <(jq -c '.[]' <<<"$apps_json")
+  apps_json=$out
+}
+
+gpu_holdings() {
+  local pid=$1 fd target canon
+  shopt -s nullglob
+  for fd in /proc/"$pid"/fd/*; do
+    target=$(readlink "$fd" 2>/dev/null) || continue
+    case $target in
+      /dev/dri/renderD[0-9]* | /dev/dri/by-path/*-render | /dev/nvidia[0-9]* | /dev/nvidiactl | /dev/nvidia-modeset | /dev/nvidia-uvm)
+        canon=$(readlink -f "$target" 2>/dev/null || printf '%s' "$target")
+        printf '%s\n' "$canon"
+        ;;
+    esac
+  done | sort -u
+  shopt -u nullglob
+}
+
+load_apps() {
+  apps_json='[]'
+  [[ ${detail:-0} == 1 ]] || return 0
+  if [[ -n ${GPU_STATUS_APPS+x} ]]; then
+    local row name gpu label id
+    if jq -e 'type == "array"' <<<"$GPU_STATUS_APPS" >/dev/null 2>&1; then
+      while IFS= read -r row; do
+        [[ -n $row ]] || continue
+        name=$(jq -r '.name // ""' <<<"$row")
+        gpu=$(jq -r '.gpu // ""' <<<"$row")
+        id=$(jq -r '.id // ""' <<<"$row")
+        label=$(app_label "$name")
+        if [[ -z $id || $id == null ]]; then
+          id=$(comm_id "$label")
+        fi
+        add_app "$id" "$label" "$gpu"
+      done < <(jq -c '.[]' <<<"$GPU_STATUS_APPS")
+    fi
+  # Hermetic tests set GPU_STATUS_ACTIVE and must not inspect this machine.
+  elif [[ -z ${GPU_STATUS_ACTIVE+x} ]]; then
+
+  local -A render_gpu=() client_comm=()
+  local path base vendor pid target node gpu nv ig comm label label_comm parent cur i uid app_id
+  local -a mine theirs
+  local holding found inherited self_comm best
+  uid=$(id -u)
+  shopt -s nullglob
+  for path in /sys/class/drm/renderD[0-9]*; do
+    [[ -d $path ]] || continue
+    base=$(basename "$path")
+    vendor=$(tr 'A-F' 'a-f' <"$path/device/vendor" 2>/dev/null | tr -d '[:space:]' || true)
+    case $vendor in
+      0x10de) render_gpu[$base]=nvidia ;;
+      0x8086) render_gpu[$base]=intel ;;
+    esac
+  done
+
+  if command -v hyprctl >/dev/null 2>&1; then
+    while IFS= read -r pid; do
+      [[ $pid =~ ^[0-9]+$ ]] || continue
+      comm=$(proc_comm "$pid") || continue
+      [[ -n $comm ]] && client_comm[$pid]=$comm
+    done < <(hyprctl clients -j 2>/dev/null | jq -r '.[].pid' 2>/dev/null || true)
+  fi
+
+  while IFS= read -r pid; do
+    pid=${pid//[[:space:]]/}
+    [[ $pid =~ ^[0-9]+$ ]] || continue
+    self_comm=$(proc_comm "$pid") || continue
+    skip_app_comm "$self_comm" && continue
+    mapfile -t mine < <(gpu_holdings "$pid")
+    [[ ${#mine[@]} -eq 0 ]] && continue
+    parent=$(awk '/^PPid:/ {print $2}' "/proc/$pid/status" 2>/dev/null || true)
+    inherited=1
+    if [[ ${#mine[@]} -gt 0 ]]; then
+      mapfile -t theirs < <(gpu_holdings "$parent")
+      for holding in "${mine[@]}"; do
+        found=0
+        for node in "${theirs[@]}"; do
+          [[ $holding == "$node" ]] && found=1 && break
+        done
+        [[ $found == 0 ]] && inherited=0 && break
+      done
+      # A child that only keeps a device its parent already opened is not
+      # drawing. Clipboard watchers and file monitors inherit the shell's fd.
+      [[ $inherited == 1 && ${#theirs[@]} -gt 0 ]] && continue
+    fi
+    nv=0
+    ig=0
+    for holding in "${mine[@]}"; do
+      base=$(basename "$holding")
+      case $base in
+        renderD[0-9]*)
+          gpu=${render_gpu[$base]:-}
+          [[ $gpu == nvidia ]] && nv=1
+          [[ $gpu == intel ]] && ig=1
+          ;;
+        nvidia*)
+          nv=1
+          ;;
+      esac
+    done
+    [[ $nv == 0 && $ig == 0 ]] && continue
+
+    cur=$pid
+    label=""
+    label_comm=""
+    for ((i = 0; i < 8; i++)); do
+      if [[ -n ${client_comm[$cur]:-} ]]; then
+        comm=${client_comm[$cur]}
+        if ! skip_app_comm "$comm"; then
+          label=$(app_label "$comm")
+          label_comm=$comm
+        fi
+        break
+      fi
+      parent=$(awk '/^PPid:/ {print $2}' "/proc/$cur/status" 2>/dev/null || true)
+      [[ $parent =~ ^[0-9]+$ ]] || break
+      [[ $parent == 0 || $parent == 1 || $parent == "$cur" ]] && break
+      cur=$parent
+    done
+    if [[ -z $label ]]; then
+      cur=$pid
+      best=""
+      for ((i = 0; i < 8; i++)); do
+        comm=$(proc_comm "$cur" || true)
+        case $comm in
+          qs | python | python3 | bash | sh | dash | node | "") ;;
+          *)
+            if ! skip_app_comm "$comm"; then
+              best=$comm
+            fi
+            ;;
+        esac
+        parent=$(awk '/^PPid:/ {print $2}' "/proc/$cur/status" 2>/dev/null || true)
+        [[ $parent =~ ^[0-9]+$ ]] || break
+        [[ $parent == 0 || $parent == 1 || $parent == "$cur" ]] && break
+        comm=$(proc_comm "$parent" || true)
+        [[ $comm == systemd ]] && break
+        cur=$parent
+      done
+      [[ -n $best ]] || best=$self_comm
+      skip_app_comm "$best" && continue
+      label=$(app_label "$best")
+      label_comm=$best
+    fi
+    [[ -n $label ]] || continue
+    app_id=$(comm_id "$label_comm")
+    if [[ $nv == 1 && $ig == 1 ]]; then
+      add_app "$app_id" "$label" both
+    elif [[ $nv == 1 ]]; then
+      add_app "$app_id" "$label" nvidia
+    else
+      add_app "$app_id" "$label" intel
+    fi
+  done < <(ps -u "$uid" -o pid=)
+  shopt -u nullglob
+  fi
+  merge_saved_apps
+  apps_json=$(jq -c 'sort_by([if .gpu == "intel" then 1 else 0 end, .name])' <<<"$apps_json")
+  annotate_apps
 }
 
 add_output() {
@@ -354,6 +904,7 @@ emit_status() {
     esac
   fi
   read_names
+  load_apps
 
   case $preference in
     intel) next=intel ;;
@@ -390,11 +941,12 @@ emit_status() {
     --argjson nvidiaPower "$(json_number "$nvidia_power")" \
     --argjson nvidiaMem "$(json_number "$nvidia_mem")" \
     --argjson outputs "$outputs_json" \
+    --argjson apps "$apps_json" \
     '{active:$active, preference:$preference, next:$next, intelName:$intelName,
       nvidiaName:$nvidiaName, detail:$detail, needsLogout:$needsLogout,
       intelPresent:$intelPresent, nvidiaPresent:$nvidiaPresent,
       nvidiaConnected:$nvidiaConnected, nvidiaUtil:$nvidiaUtil,
-      nvidiaPower:$nvidiaPower, nvidiaMem:$nvidiaMem, outputs:$outputs}'
+      nvidiaPower:$nvidiaPower, nvidiaMem:$nvidiaMem, outputs:$outputs, apps:$apps}'
 }
 
 self_test() {
@@ -402,7 +954,7 @@ self_test() {
   tmp=$(mktemp -d)
   script=$(readlink -f "$0")
   trap 'rm -rf "$tmp"' RETURN
-  mkdir -p "$tmp/config/uwsm"
+  mkdir -p "$tmp/config/uwsm" "$tmp/nobin" "$tmp/data"
 
   fail() {
     echo "gpu-status self-test failed: $*" >&2
@@ -427,12 +979,16 @@ self_test() {
       GPU_STATUS_INTEL_NAME='<b>UHD</b>' \
       GPU_STATUS_NVIDIA_CSV='<img src="https://evil.invalid/t.png">&, 12, 19.5, 100' \
       GPU_STATUS_OUTPUTS='[{"connector":"DP-3","gpu":"nvidia","desktop":true},{"connector":"<bad>","gpu":"intel"}]' \
+      GPU_STATUS_APPS='[{"name":"<&Chromium>","gpu":"nvidia"},{"name":"foot","gpu":"intel"},{"name":"Game","gpu":"both"},{"name":"nope","gpu":"amd"},{"name":"","gpu":"intel"}]' \
+      GPU_STATUS_BIN_DIR="$tmp/nobin" \
+      XDG_DATA_HOME="$tmp/data" \
       bash "$script" status
   )
   assert_jq "$json" '.active == "intel" and .preference == "auto" and .next == "nvidia" and .needsLogout == true and .detail == true'
   assert_jq "$json" '.nvidiaUtil == 12 and .nvidiaPower == 19.5 and .nvidiaMem == 100'
   assert_jq "$json" '.outputs | length == 1 and .[0].connector == "DP-3" and .[0].desktop == true'
-  if printf '%s' "$json" | jq -r '.intelName, .nvidiaName, .outputs[].connector' | grep -q '[<>&]'; then
+  assert_jq "$json" '.apps | length == 3 and .[0].id == "chromium" and .[0].name == "Chromium" and .[0].gpu == "nvidia" and .[0].preference == "desktop" and .[0].launchable == false and .[1].id == "game" and .[1].name == "Game" and .[1].gpu == "both" and .[2].id == "foot" and .[2].name == "Foot" and .[2].gpu == "intel"'
+  if printf '%s' "$json" | jq -r '.intelName, .nvidiaName, .outputs[].connector, .apps[].name, .apps[].id' | grep -q '[<>&]'; then
     fail "markup survived in a name shown by the panel"
   fi
 
@@ -446,7 +1002,7 @@ self_test() {
       GPU_STATUS_OUTPUTS='[]' \
       bash "$script" brief
   )
-  assert_jq "$json" '.preference == "intel" and .next == "intel" and .needsLogout == true and .detail == false and .nvidiaUtil == null'
+  assert_jq "$json" '.preference == "intel" and .next == "intel" and .needsLogout == true and .detail == false and .nvidiaUtil == null and .apps == []'
 
   rm -f "$tmp/config/uwsm/gpu-mode"
   json=$(
@@ -569,6 +1125,178 @@ self_test() {
   )
   assert_jq "$json" '.intelPresent == true and .nvidiaPresent == false'
 
+  local mode_before launch app_json wrapper desk
+  mode_before=$(cat "$tmp/config/uwsm/gpu-mode")
+  mkdir -p "$tmp/bins" "$tmp/desktops" "$tmp/pci/0000:00:02.0" "$tmp/pci/0000:01:00.0" \
+    "$tmp/sys/renderD128" "$tmp/sys/renderD129" "$tmp/data/applications"
+  printf '0x8086\n' >"$tmp/pci/0000:00:02.0/vendor"
+  printf '0x10de\n' >"$tmp/pci/0000:01:00.0/vendor"
+  ln -s "$tmp/pci/0000:00:02.0" "$tmp/sys/renderD129/device"
+  ln -s "$tmp/pci/0000:01:00.0" "$tmp/sys/renderD128/device"
+  cat >"$tmp/bins/chromium" <<EOF
+#!/bin/bash
+touch "$tmp/executed"
+EOF
+  cat >"$tmp/bins/voxtype" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+  chmod 755 "$tmp/bins/chromium" "$tmp/bins/voxtype"
+  cat >"$tmp/desktops/chromium.desktop" <<'EOF'
+[Desktop Entry]
+Name=Chromium
+Exec=chromium %U
+Exec=/usr/bin/chromium --temp-profile
+TryExec=chromium
+Exec=other-helper
+Exec=chromium --incognito
+EOF
+  cat >"$tmp/desktops/voxtype.desktop" <<'EOF'
+[Desktop Entry]
+Exec=voxtype
+EOF
+  launch=$(dirname "$script")/gpu-launch
+  chmod 755 "$launch"
+
+  set +e
+  XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+    GPU_STATUS_BIN_DIR="$tmp/bins" GPU_STATUS_DESKTOP_DIR="$tmp/desktops" \
+    bash "$script" set-app 'chromium;touch /tmp/gpu-widget-pwned' intel >/dev/null 2>&1
+  code=$?
+  set -e
+  [[ $code -ne 0 ]] || fail "poison app id was accepted"
+  [[ ! -e /tmp/gpu-widget-pwned ]] || fail "app id was executed"
+  [[ ! -e $tmp/config/uwsm/gpu-apps ]] || fail "poison id wrote a preference"
+  [[ $(cat "$tmp/config/uwsm/gpu-mode") == "$mode_before" ]] || fail "set-app changed the login GPU"
+
+  XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+    GPU_STATUS_BIN_DIR="$tmp/bins" GPU_STATUS_DESKTOP_DIR="$tmp/desktops" \
+    GPU_STATUS_ACTIVE=nvidia GPU_STATUS_NV_CONNECTED=1 \
+    GPU_STATUS_NVIDIA_PRESENT=1 GPU_STATUS_INTEL_PRESENT=1 \
+    GPU_STATUS_OUTPUTS='[]' \
+    bash "$script" set-app chromium intel >/dev/null
+  wrapper=$tmp/data/aponhcet.gpu/bin/chromium
+  desk=$tmp/data/applications/chromium.desktop
+  [[ -x $wrapper ]] || fail "app wrapper is not executable"
+  grep -q -F "# aponhcet.gpu wrapper chromium" "$wrapper" || fail "wrapper is not marked"
+  [[ -f $desk ]] || fail "desktop override was not written"
+  grep -q '^X-AponhcetGpu=1$' "$desk" || fail "desktop override is not marked"
+  grep -q -F "Exec=$wrapper %U" "$desk" || fail "Exec %U was not rewritten"
+  grep -q -F "Exec=$wrapper --temp-profile" "$desk" || fail "absolute Exec was not rewritten"
+  grep -q -F "Exec=$wrapper --incognito" "$desk" || fail "incognito Exec was not rewritten"
+  grep -q -F "TryExec=$wrapper" "$desk" || fail "TryExec was not rewritten"
+  grep -q -F "Exec=other-helper" "$desk" || fail "unrelated Exec was rewritten"
+  grep -q "^chromium intel $tmp/bins/chromium chromium.desktop$" "$tmp/config/uwsm/gpu-apps" || fail "app preference was not saved"
+  [[ $(cat "$tmp/config/uwsm/gpu-mode") == "$mode_before" ]] || fail "app pin changed the login GPU"
+  [[ ! -e $tmp/executed ]] || fail "set-app started the program"
+
+  app_json=$(
+    XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+      GPU_STATUS_BIN_DIR="$tmp/bins" GPU_STATUS_DESKTOP_DIR="$tmp/desktops" \
+      GPU_STATUS_SYS_DRM="$tmp/sys" GPU_STATUS_DRI_ROOT="$tmp/missing-dri" \
+      bash "$launch" --print chromium
+  )
+  [[ $app_json == *"mode=intel"* ]] || fail "launch print lost the intel mode"
+  [[ $app_json == *"binary=$tmp/bins/chromium"* ]] || fail "launch print used the wrong program"
+  [[ $app_json == *"gl=mesa"* ]] || fail "launch print lost the mesa driver"
+  [[ $app_json == *"flag=--render-node-override=$tmp/missing-dri/by-path/pci-0000:00:02.0-render"* ]] || fail "launch print lost the render node"
+  [[ ! -e $tmp/executed ]] || fail "--print started the program"
+  set +e
+  XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+    GPU_STATUS_BIN_DIR="$tmp/bins" GPU_STATUS_SYS_DRM="$tmp/sys" \
+    GPU_STATUS_DRI_ROOT="$tmp/missing-dri" \
+    bash "$launch" chromium >/dev/null 2>&1
+  code=$?
+  set -e
+  [[ $code -ne 0 ]] || fail "missing render node still launched chromium"
+  [[ ! -e $tmp/executed ]] || fail "missing render node started chromium"
+
+  json=$(
+    XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+      GPU_STATUS_BIN_DIR="$tmp/bins" \
+      GPU_STATUS_ACTIVE=nvidia GPU_STATUS_NV_CONNECTED=1 \
+      GPU_STATUS_NVIDIA_PRESENT=1 GPU_STATUS_INTEL_PRESENT=1 \
+      GPU_STATUS_INTEL_NAME=UHD GPU_STATUS_NVIDIA_CSV= \
+      GPU_STATUS_OUTPUTS='[]' \
+      bash "$script" status
+  )
+  assert_jq "$json" '.apps | length == 1 and .[0].id == "chromium" and .[0].gpu == "none" and .[0].preference == "intel" and .[0].launchable == true and .[0].attached == true'
+  json=$(
+    XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+      GPU_STATUS_BIN_DIR="$tmp/bins" \
+      GPU_STATUS_ACTIVE=nvidia GPU_STATUS_NV_CONNECTED=1 \
+      GPU_STATUS_NVIDIA_PRESENT=1 GPU_STATUS_INTEL_PRESENT=1 \
+      GPU_STATUS_OUTPUTS='[]' \
+      bash "$script" brief
+  )
+  assert_jq "$json" '.apps == []'
+
+  XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+    GPU_STATUS_BIN_DIR="$tmp/bins" GPU_STATUS_DESKTOP_DIR="$tmp/desktops" \
+    GPU_STATUS_ACTIVE=nvidia GPU_STATUS_NV_CONNECTED=1 \
+    GPU_STATUS_NVIDIA_PRESENT=1 GPU_STATUS_INTEL_PRESENT=1 \
+    GPU_STATUS_OUTPUTS='[]' \
+    bash "$script" set-app voxtype nvidia >/dev/null
+  app_json=$(
+    XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+      GPU_STATUS_BIN_DIR="$tmp/bins" GPU_STATUS_SYS_DRM="$tmp/sys" \
+      bash "$launch" --print voxtype
+  )
+  [[ $app_json == *"mode=nvidia"* && $app_json == *"gl=nvidia"* && $app_json == *"flag=-"* ]] || fail "non-browser pin passed a render node"
+
+  printf '%s\n' 'Exec=chromium %U' 'Name=Mine' >"$tmp/data/applications/chromium.desktop"
+  XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+    GPU_STATUS_BIN_DIR="$tmp/bins" GPU_STATUS_DESKTOP_DIR="$tmp/desktops" \
+    GPU_STATUS_ACTIVE=nvidia GPU_STATUS_NV_CONNECTED=1 \
+    GPU_STATUS_NVIDIA_PRESENT=1 GPU_STATUS_INTEL_PRESENT=1 \
+    GPU_STATUS_OUTPUTS='[]' \
+    bash "$script" set-app chromium nvidia >/dev/null
+  [[ $(cat "$tmp/data/applications/chromium.desktop") == $'Exec=chromium %U\nName=Mine' ]] || fail "foreign desktop file was overwritten"
+  grep -q '^chromium nvidia ' "$tmp/config/uwsm/gpu-apps" || fail "preference was not saved beside a foreign desktop"
+  json=$(
+    XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+      GPU_STATUS_BIN_DIR="$tmp/bins" \
+      GPU_STATUS_ACTIVE=nvidia GPU_STATUS_NV_CONNECTED=1 \
+      GPU_STATUS_NVIDIA_PRESENT=1 GPU_STATUS_INTEL_PRESENT=1 \
+      GPU_STATUS_INTEL_NAME=UHD GPU_STATUS_NVIDIA_CSV= \
+      GPU_STATUS_OUTPUTS='[]' \
+      bash "$script" status
+  )
+  assert_jq "$json" '.apps | map(select(.id == "chromium")) | .[0].preference == "nvidia" and .[0].attached == false'
+
+  XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+    GPU_STATUS_BIN_DIR="$tmp/bins" GPU_STATUS_DESKTOP_DIR="$tmp/desktops" \
+    GPU_STATUS_ACTIVE=nvidia GPU_STATUS_NV_CONNECTED=1 \
+    GPU_STATUS_NVIDIA_PRESENT=1 GPU_STATUS_INTEL_PRESENT=1 \
+    GPU_STATUS_OUTPUTS='[]' \
+    bash "$script" set-app chromium desktop >/dev/null
+  [[ $(cat "$tmp/data/applications/chromium.desktop") == $'Exec=chromium %U\nName=Mine' ]] || fail "Desktop removed a foreign menu entry"
+  [[ ! -e $wrapper ]] || fail "Desktop left the chromium wrapper"
+  if [[ -f $tmp/config/uwsm/gpu-apps ]] && grep -q '^chromium ' "$tmp/config/uwsm/gpu-apps"; then
+    fail "Desktop left the chromium preference"
+  fi
+
+  rm -f "$tmp/data/applications/chromium.desktop"
+  XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+    GPU_STATUS_BIN_DIR="$tmp/bins" GPU_STATUS_DESKTOP_DIR="$tmp/desktops" \
+    GPU_STATUS_ACTIVE=nvidia GPU_STATUS_NV_CONNECTED=1 \
+    GPU_STATUS_NVIDIA_PRESENT=1 GPU_STATUS_INTEL_PRESENT=1 \
+    GPU_STATUS_OUTPUTS='[]' \
+    bash "$script" set-app chromium intel >/dev/null
+  [[ -f $desk && -x $wrapper ]] || fail "pin did not return after Desktop"
+  XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+    GPU_STATUS_BIN_DIR="$tmp/bins" GPU_STATUS_DESKTOP_DIR="$tmp/desktops" \
+    GPU_STATUS_ACTIVE=nvidia GPU_STATUS_NV_CONNECTED=1 \
+    GPU_STATUS_NVIDIA_PRESENT=1 GPU_STATUS_INTEL_PRESENT=1 \
+    GPU_STATUS_OUTPUTS='[]' \
+    bash "$script" set-app chromium desktop >/dev/null
+  [[ ! -e $desk && ! -e $wrapper ]] || fail "Desktop left a menu entry we created"
+  if [[ -f $tmp/config/uwsm/gpu-apps ]] && grep -q '^chromium ' "$tmp/config/uwsm/gpu-apps"; then
+    fail "Desktop left a marked app preference"
+  fi
+  [[ -x $tmp/data/aponhcet.gpu/bin/voxtype ]] || fail "removing chromium removed voxtype"
+  [[ $(cat "$tmp/config/uwsm/gpu-mode") == "$mode_before" ]] || fail "app edits changed the login GPU"
+
   if command -v node >/dev/null 2>&1; then
     node -e '
 const fs = require("fs")
@@ -582,6 +1310,8 @@ if (/[<>&]/.test(dirty)) process.exit(1)
 if (sandbox.plain("RTX 3080") !== "RTX 3080") process.exit(1)
 if (sandbox.plain(null) !== "") process.exit(1)
 if (sandbox.plain("x".repeat(200)).length !== 96) process.exit(1)
+if (!sandbox.allowedAppPref("desktop") || !sandbox.allowedAppPref("intel") || sandbox.allowedAppPref("auto")) process.exit(1)
+if (!sandbox.allowedAppId("chromium") || sandbox.allowedAppId("chromium;touch") || sandbox.allowedAppId("../etc")) process.exit(1)
 ' "$(dirname "$script")/Model.js" || fail "Model.plain kept markup"
   else
     fail "node is required to test Model.plain"
@@ -608,8 +1338,13 @@ case $command in
     detail=0
     emit_status
     ;;
+  set-app)
+    set_app "${2:-}" "${3:-}"
+    detail=0
+    emit_status
+    ;;
   *)
-    echo "usage: gpu-status [brief|status|set auto|intel|nvidia|--self-test]" >&2
+    echo "usage: gpu-status [brief|status|set auto|intel|nvidia|set-app ID desktop|intel|nvidia|--self-test]" >&2
     exit 2
     ;;
 esac

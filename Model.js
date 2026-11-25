@@ -17,3 +17,11 @@ function allowedMode(mode) {
 function allowedGpu(gpu) {
   return gpu === "intel" || gpu === "nvidia" || gpu === "other" || gpu === "unknown"
 }
+
+function allowedAppPref(mode) {
+  return mode === "desktop" || mode === "intel" || mode === "nvidia"
+}
+
+function allowedAppId(id) {
+  return /^[a-z0-9][a-z0-9._+-]{0,40}$/.test(String(id == null ? "" : id))
+}

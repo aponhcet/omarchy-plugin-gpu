@@ -105,7 +105,9 @@ The value in `gpu-mode` is only compared as a prefix. It is never run as a comma
 
 Left-click the bar label (`iGPU` or `NV`) to open the panel. Right-click cycles Auto, Intel, and NVIDIA. The label uses the accent color when the running desktop and the next login disagree.
 
-The panel lists connected screens, and, while it is open, NVIDIA load, power, and memory. The bar itself does not call `nvidia-smi`, because that wakes the discrete GPU.
+The panel lists connected screens and, while it is open, which apps are drawing on Intel, NVIDIA, or both, plus NVIDIA load, power, and memory. The bar itself does not call `nvidia-smi` or inspect apps, because that work stays off the polling path that would wake the discrete GPU.
+
+**Advanced** opens a Desktop, Intel, or NVIDIA choice under each app. Desktop follows the login choice. Intel or NVIDIA is remembered by the widget and applied the next time that app starts from its menu. The app that is already open keeps its current GPU until you quit it. A program with no menu entry is still remembered, and the panel says so.
 
 Choosing a mode writes `~/.config/uwsm/gpu-mode` and leaves the session running. When a logout would apply the new GPU, the panel shows **Log out to apply**. A second click asks **Log out now?** and then runs `omarchy system logout`, which closes your applications. Closing the panel disarms that button.
 
@@ -118,6 +120,8 @@ omarchy-shell aponhcet.gpu status
 omarchy-shell aponhcet.gpu choose auto
 omarchy-shell aponhcet.gpu choose intel
 omarchy-shell aponhcet.gpu choose nvidia
+omarchy-shell aponhcet.gpu pin chromium intel
+omarchy-shell aponhcet.gpu pin chromium desktop
 ```
 
 ## Update
@@ -134,9 +138,19 @@ omarchy plugin remove aponhcet.gpu
 
 Removing the widget leaves `~/.config/uwsm/gpu-mode` and `~/.config/uwsm/env-hyprland` in place. Delete the mode file to return the login rule to Auto, and remove the snippet above if you no longer want it to set `AQ_DRM_DEVICES`.
 
+It also leaves per-app choices in `~/.config/uwsm/gpu-apps`, the small launchers under `~/.local/share/aponhcet.gpu/bin/`, and menu entries in `~/.local/share/applications/` marked `X-AponhcetGpu=1`. Choose Desktop for those apps before removing the widget, or delete those files. A menu entry left behind points at a launcher that is gone.
+
 ## Dependencies
 
-Omarchy with the Quickshell bar, `bash`, and `jq`. `hyprctl` marks which connector is showing the desktop. `lspci` (pciutils) supplies the Intel product name. `nvidia-smi` supplies the NVIDIA line in the open panel, and is skipped when it is missing. `node` is used only by `bash gpu-status --self-test`.
+Omarchy with the Quickshell bar, `bash`, and `jq`. `hyprctl` marks which connector is showing the desktop. `lspci` (pciutils) supplies the Intel product name. `nvidia-smi` supplies the NVIDIA line in the open panel, and is skipped when it is missing. `node` is used only by the test suite.
+
+## Test
+
+```bash
+bash test/qa.sh
+```
+
+The suite runs in temporary directories. It does not read or write your login GPU, your per-app choices, or the running session. It checks the manifest, the English catalog, plain-text rendering, animation timing, poisoned names, and the launcher files. On Omarchy it also runs `omarchy plugin validate`. GitHub runs the same suite on every push.
 
 ## License
 

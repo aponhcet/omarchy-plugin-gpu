@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls as Controls
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -29,6 +30,8 @@ Panel {
   property var nvidiaPower: null
   property var nvidiaMem: null
   property var outputs: []
+  property var apps: []
+  property bool appsAdvanced: false
   property string error: ""
   property bool logoutArmed: false
   property string focusSection: "modes"
@@ -121,6 +124,30 @@ Panel {
       nvidiaUtil = asNumber(data.nvidiaUtil)
       nvidiaPower = asNumber(data.nvidiaPower)
       nvidiaMem = asNumber(data.nvidiaMem)
+      var found = []
+      if (Array.isArray(data.apps)) {
+        var appCount = Math.min(data.apps.length, 8)
+        for (var a = 0; a < appCount; a++) {
+          var app = data.apps[a]
+          if (!app) continue
+          var appName = Model.plain(app.name)
+          if (appName === "") continue
+          var appGpu = app.gpu === "intel" || app.gpu === "nvidia" || app.gpu === "both" || app.gpu === "none" ? app.gpu : ""
+          if (appGpu === "") continue
+          var appId = Model.allowedAppId(app.id) ? app.id : ""
+          if (appId === "" && appGpu === "none") continue
+          var appPref = app.preference === "intel" || app.preference === "nvidia" ? app.preference : "desktop"
+          found.push({
+            id: appId,
+            name: appName,
+            gpu: appGpu,
+            preference: appPref,
+            launchable: app.launchable === true && appId !== "",
+            attached: app.attached === true
+          })
+        }
+      }
+      apps = found
     }
     var list = []
     if (Array.isArray(data.outputs)) {
@@ -163,6 +190,16 @@ Panel {
     logoutArmed = false
     requestId += 1
     setProc.command = ["bash", scriptPath, "set", mode]
+    setProc.running = true
+  }
+
+  function setAppPref(id, mode) {
+    if (!Model.allowedAppId(id) || !Model.allowedAppPref(mode)) return
+    if (mode === "intel" && !intelPresent) return
+    if (mode === "nvidia" && !nvidiaPresent) return
+    if (scriptPath === "" || setProc.running) return
+    requestId += 1
+    setProc.command = ["bash", scriptPath, "set-app", id, mode]
     setProc.running = true
   }
 
@@ -217,6 +254,7 @@ Panel {
   onOpenedChanged: {
     logoutArmed = false
     cursorActive = false
+    if (!opened) appsAdvanced = false
     modeIndex = Math.max(0, modes.indexOf(preference))
     refresh()
     poll.restart()
@@ -287,6 +325,10 @@ Panel {
     function status(): string { return root.statusLine() }
     function choose(id: string): string {
       root.setMode(id)
+      return "ok"
+    }
+    function pin(id: string, mode: string): string {
+      root.setAppPref(id, mode)
       return "ok"
     }
   }
@@ -457,6 +499,263 @@ Panel {
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             elide: Text.ElideRight
+          }
+        }
+
+        PanelSeparator { foreground: root.foreground }
+
+        Column {
+          width: parent.width
+          spacing: Style.space(8)
+
+          PanelSectionHeader {
+            text: strings.t("gpu.apps")
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+          }
+
+          Button {
+            width: parent.width
+            visible: root.apps.length > 0
+            text: strings.t("gpu.advanced")
+            fontSize: Style.font.bodySmall
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            bordered: true
+            active: root.appsAdvanced
+            onClicked: root.appsAdvanced = !root.appsAdvanced
+          }
+
+          Text {
+            width: parent.width
+            visible: root.apps.length === 0
+            textFormat: Text.PlainText
+            text: strings.t("gpu.noApps")
+            color: Qt.darker(root.foreground, 1.4)
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+          }
+
+          Repeater {
+            model: root.apps
+            Column {
+              id: appRow
+              required property var modelData
+              width: column.width
+              spacing: 0
+              readonly property string appId: modelData && modelData.id ? modelData.id : ""
+              readonly property string appPref: modelData && (modelData.preference === "intel" || modelData.preference === "nvidia") ? modelData.preference : "desktop"
+              readonly property bool appLaunchable: !!(modelData && modelData.launchable && appId !== "")
+              readonly property bool appAttached: !!(modelData && modelData.attached)
+              readonly property bool showChoices: root.appsAdvanced && (appLaunchable || (appPref !== "desktop" && !appAttached))
+
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: {
+                  var _lang = strings.language
+                  if (appRow.modelData.gpu === "both") {
+                    return strings.t("gpu.appBoth")
+                      .arg(appRow.modelData.name)
+                      .arg(strings.t("gpu.nvidia"))
+                      .arg(strings.t("gpu.intel"))
+                  }
+                  if (appRow.modelData.gpu === "none")
+                    return strings.t("gpu.appIdle").arg(appRow.modelData.name)
+                  return strings.t("gpu.appOne").arg(appRow.modelData.name).arg(root.gpuWord(appRow.modelData.gpu))
+                }
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                elide: Text.ElideRight
+              }
+
+              Item {
+                id: reveal
+                width: parent.width
+                clip: true
+                height: appRow.showChoices ? revealBody.implicitHeight : 0
+                Behavior on height {
+                  NumberAnimation {
+                    duration: Style.duration(root.appsAdvanced ? 180 : 120)
+                    easing.type: Easing.Bezier
+                    easing.bezierCurve: Style.easeOut
+                  }
+                }
+
+                Column {
+                  id: revealBody
+                  width: parent.width
+                  spacing: Style.space(4)
+                  topPadding: Style.space(6)
+                  y: root.appsAdvanced ? 0 : -Style.space(8)
+                  opacity: root.appsAdvanced ? 1 : 0
+                  Behavior on y {
+                    NumberAnimation {
+                      duration: Style.duration(root.appsAdvanced ? 180 : 120)
+                      easing.type: Easing.Bezier
+                      easing.bezierCurve: Style.easeOut
+                    }
+                  }
+                  Behavior on opacity {
+                    NumberAnimation {
+                      duration: Style.duration(root.appsAdvanced ? 160 : 100)
+                      easing.type: Easing.OutCubic
+                    }
+                  }
+
+                  Row {
+                    id: appModeRow
+                    visible: appRow.appLaunchable
+                    width: parent.width
+                    spacing: Style.space(6)
+                    readonly property real cellWidth: (width - spacing * 2) / 3
+
+                    Repeater {
+                      model: ["desktop", "intel", "nvidia"]
+                      Button {
+                        id: gpuChoice
+                        required property var modelData
+                        width: appModeRow.cellWidth
+                        text: {
+                          var _lang = strings.language
+                          if (modelData === "intel") return strings.t("gpu.intel")
+                          if (modelData === "nvidia") return strings.t("gpu.nvidia")
+                          return strings.t("gpu.appDesktop")
+                        }
+                        fontSize: Style.font.bodySmall
+                        foreground: root.foreground
+                        fontFamily: root.fontFamily
+                        bordered: true
+                        enabled: root.appsAdvanced && (modelData === "desktop" || (modelData === "intel" && root.intelPresent) || (modelData === "nvidia" && root.nvidiaPresent))
+                        opacity: enabled ? 1 : 0.35
+                        active: appRow.appPref === modelData
+                        hasCursor: false
+                        onClicked: root.setAppPref(appRow.appId, modelData)
+
+                        HoverHandler {
+                          id: pointer
+                          onHoveredChanged: {
+                            if (hovered && gpuChoice.modelData === "desktop") tipWait.restart()
+                            else {
+                              tipWait.stop()
+                              tip.tipOpen = false
+                            }
+                          }
+                        }
+
+                        Timer {
+                          id: tipWait
+                          interval: Math.max(Style.duration(90), 1)
+                          onTriggered: tip.tipOpen = true
+                        }
+
+                        // The choice row is clipped while it slides open, so the
+                        // note is parented to the window overlay and tracks the pointer.
+                        PanelToolTip {
+                          id: tip
+                          property bool tipOpen: false
+                          parent: Controls.Overlay.overlay
+                          visible: root.opened && root.appsAdvanced && gpuChoice.modelData === "desktop" && tipOpen && pointer.hovered
+                          text: strings.t("gpu.appDesktopTip")
+                          delay: 0
+                          closePolicy: Controls.Popup.NoAutoClose
+                          transformOrigin: Item.Top
+                          x: {
+                            var overlay = Controls.Overlay.overlay
+                            var raw = pointer.point.scenePosition.x - width / 2
+                            if (!overlay) return raw
+                            return Math.max(Style.space(8), Math.min(raw, overlay.width - width - Style.space(8)))
+                          }
+                          y: pointer.point.scenePosition.y + Style.space(18)
+                          enter: Transition {
+                            ParallelAnimation {
+                              NumberAnimation {
+                                property: "opacity"
+                                from: 0
+                                to: 1
+                                duration: Style.duration(140)
+                                easing.type: Easing.OutCubic
+                              }
+                              NumberAnimation {
+                                property: "scale"
+                                from: 0.96
+                                to: 1
+                                duration: Style.duration(140)
+                                easing.type: Easing.Bezier
+                                easing.bezierCurve: Style.easeOut
+                              }
+                            }
+                          }
+                          exit: Transition {
+                            NumberAnimation {
+                              property: "opacity"
+                              from: 1
+                              to: 0
+                              duration: Style.duration(100)
+                              easing.type: Easing.OutCubic
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+
+                  Text {
+                    width: parent.width
+                    visible: appRow.appPref !== "desktop" && !appRow.appAttached
+                    wrapMode: Text.WordWrap
+                    textFormat: Text.PlainText
+                    text: strings.t("gpu.appNoLauncher")
+                    color: Qt.darker(root.foreground, 1.4)
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+              }
+            }
+          }
+
+          Item {
+            width: parent.width
+            clip: true
+            visible: root.apps.length > 0
+            height: root.appsAdvanced ? launchNote.implicitHeight : 0
+            Behavior on height {
+              NumberAnimation {
+                duration: Style.duration(root.appsAdvanced ? 180 : 120)
+                easing.type: Easing.Bezier
+                easing.bezierCurve: Style.easeOut
+              }
+            }
+
+            Text {
+              id: launchNote
+              width: parent.width
+              topPadding: Style.space(6)
+              wrapMode: Text.WordWrap
+              textFormat: Text.PlainText
+              text: strings.t("gpu.appLaunch")
+              color: Qt.darker(root.foreground, 1.4)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              y: root.appsAdvanced ? 0 : -Style.space(8)
+              opacity: root.appsAdvanced ? 1 : 0
+              Behavior on y {
+                NumberAnimation {
+                  duration: Style.duration(root.appsAdvanced ? 180 : 120)
+                  easing.type: Easing.Bezier
+                  easing.bezierCurve: Style.easeOut
+                }
+              }
+              Behavior on opacity {
+                NumberAnimation {
+                  duration: Style.duration(root.appsAdvanced ? 160 : 100)
+                  easing.type: Easing.OutCubic
+                }
+              }
+            }
           }
         }
 

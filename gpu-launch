@@ -1,0 +1,207 @@
+#!/bin/bash
+
+# Start one app on the GPU saved by the widget.
+#
+# A menu entry must use a single absolute executable. omarchy-launch-browser
+# keeps only the first word of Exec=, so the desktop file points at a
+# one-word wrapper and that wrapper calls this script with a fixed app id.
+# The choice is read here, at start time. Desktop, or a missing line, runs
+# the real program unchanged.
+
+set -euo pipefail
+
+apps_file() {
+  local config_home=${XDG_CONFIG_HOME:-$HOME/.config}
+  printf '%s\n' "$config_home/uwsm/gpu-apps"
+}
+
+data_root() {
+  printf '%s' "${XDG_DATA_HOME:-$HOME/.local/share}"
+}
+
+sys_drm() {
+  printf '%s' "${GPU_STATUS_SYS_DRM:-/sys/class/drm}"
+}
+
+dri_root() {
+  printf '%s' "${GPU_STATUS_DRI_ROOT:-/dev/dri}"
+}
+
+# Chromium follows the desktop GPU unless the launch names a render node.
+wants_render_node() {
+  case $1 in
+    chromium | chromium-browser | google-chrome | google-chrome-stable | brave | brave-browser | microsoft-edge | microsoft-edge-stable | electron)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+lookup_pin() {
+  local want=$1 file line
+  pin_mode=desktop
+  pin_binary=""
+  file=$(apps_file)
+  [[ -f $file ]] || return 0
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ ^([a-z0-9][a-z0-9._+-]{0,40})[[:space:]]+(intel|nvidia)[[:space:]]+(/[^[:space:]]+)[[:space:]]+([^[:space:]]+)$ ]] || continue
+    [[ ${BASH_REMATCH[1]} == "$want" ]] || continue
+    pin_mode=${BASH_REMATCH[2]}
+    pin_binary=${BASH_REMATCH[3]}
+    return 0
+  done <"$file"
+}
+
+resolve_bin() {
+  local id=$1 candidate
+  if [[ -n ${GPU_STATUS_BIN_DIR+x} ]]; then
+    candidate=${GPU_STATUS_BIN_DIR}/$id
+    if [[ -x $candidate && ! -d $candidate && $candidate != *" "* ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+    return 1
+  fi
+  local dir
+  for dir in /usr/local/bin /usr/bin; do
+    candidate=$dir/$id
+    [[ -x $candidate && ! -d $candidate ]] || continue
+    printf '%s' "$candidate"
+    return 0
+  done
+  return 1
+}
+
+# Prefer the stable by-path node. Numbered renderD nodes move between boots.
+render_node_for() {
+  local want=$1 vendor_want sys dri dev vendor pci node base
+  case $want in
+    intel) vendor_want=0x8086 ;;
+    nvidia) vendor_want=0x10de ;;
+    *) return 1 ;;
+  esac
+  sys=$(sys_drm)
+  dri=$(dri_root)
+  shopt -s nullglob
+  for dev in "$sys"/renderD[0-9]*; do
+    [[ -r $dev/device/vendor ]] || continue
+    vendor=$(tr 'A-F' 'a-f' <"$dev/device/vendor" | tr -d '[:space:]' || true)
+    [[ $vendor == "$vendor_want" ]] || continue
+    pci=$(basename "$(readlink -f "$dev/device" 2>/dev/null || true)")
+    if [[ $pci =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$ ]]; then
+      node=$dri/by-path/pci-$pci-render
+      if [[ -e $node || -n ${GPU_STATUS_SYS_DRM+x} ]]; then
+        printf '%s' "$node"
+        shopt -u nullglob
+        return 0
+      fi
+    fi
+    base=$(basename "$dev")
+    node=$dri/$base
+    if [[ -e $node || -n ${GPU_STATUS_SYS_DRM+x} ]]; then
+      printf '%s' "$node"
+      shopt -u nullglob
+      return 0
+    fi
+  done
+  shopt -u nullglob
+  return 1
+}
+
+user_has_override() {
+  local arg
+  for arg in "$@"; do
+    case $arg in
+      --render-node-override | --render-node-override=*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+print_only=0
+if [[ ${1:-} == --print ]]; then
+  print_only=1
+  shift
+fi
+
+id=${1:-}
+[[ $id =~ ^[a-z0-9][a-z0-9._+-]{0,40}$ ]] || {
+  echo "gpu-launch: bad app id" >&2
+  exit 2
+}
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+
+pin_mode=desktop
+pin_binary=""
+lookup_pin "$id"
+
+binary=""
+if [[ -n $pin_binary && -x $pin_binary && ! -d $pin_binary && $pin_binary != *" "* ]]; then
+  binary=$pin_binary
+else
+  binary=$(resolve_bin "$id" || true)
+fi
+[[ -n $binary ]] || {
+  echo "gpu-launch: no program for $id" >&2
+  exit 1
+}
+
+case $binary in
+  "$(data_root)/aponhcet.gpu/bin/"*)
+    echo "gpu-launch: refusing to run the wrapper" >&2
+    exit 1
+    ;;
+esac
+
+mode=$pin_mode
+node=""
+flag=""
+gl="-"
+if [[ $mode == intel || $mode == nvidia ]]; then
+  gl=$([[ $mode == intel ]] && echo mesa || echo nvidia)
+  if wants_render_node "$id"; then
+    node=$(render_node_for "$mode" || true)
+    if [[ -z $node ]]; then
+      echo "gpu-launch: no $mode render node for $id" >&2
+      [[ $print_only == 1 ]] || exit 1
+    elif [[ $print_only == 0 && ! -e $node ]]; then
+      echo "gpu-launch: $mode render node is missing: $node" >&2
+      exit 1
+    elif ! user_has_override "$@"; then
+      flag="--render-node-override=$node"
+    fi
+  fi
+fi
+
+if [[ $print_only == 1 ]]; then
+  printf 'mode=%s\n' "$mode"
+  printf 'binary=%s\n' "$binary"
+  printf 'node=%s\n' "${node:--}"
+  printf 'gl=%s\n' "$gl"
+  printf 'flag=%s\n' "${flag:--}"
+  exit 0
+fi
+
+if [[ $mode == desktop ]]; then
+  exec "$binary" "$@"
+fi
+
+if [[ $mode == intel ]]; then
+  unset __NV_PRIME_RENDER_OFFLOAD __VK_LAYER_NV_optimus
+  export __GLX_VENDOR_LIBRARY_NAME=mesa
+  export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
+  export VK_LOADER_DRIVERS_SELECT=intel_icd.json
+else
+  unset __EGL_VENDOR_LIBRARY_FILENAMES
+  export __NV_PRIME_RENDER_OFFLOAD=1
+  export __GLX_VENDOR_LIBRARY_NAME=nvidia
+  export __VK_LAYER_NV_optimus=NVIDIA_only
+  export VK_LOADER_DRIVERS_SELECT=nvidia_icd.json
+fi
+
+if [[ -n $flag ]]; then
+  exec "$binary" "$flag" "$@"
+fi
+exec "$binary" "$@"
