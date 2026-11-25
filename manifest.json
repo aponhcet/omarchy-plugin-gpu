@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "aponhcet.gpu",
+  "name": "GPU",
+  "version": "1.0.0",
+  "author": "aponhcet",
+  "license": "MIT",
+  "description": "Shows which GPU the desktop is rendering on, and chooses Intel or NVIDIA for the next login.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "GPU",
+    "description": "See the desktop GPU and switch it for the next login.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

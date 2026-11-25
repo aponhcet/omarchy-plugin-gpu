@@ -1,0 +1,615 @@
+#!/bin/bash
+
+# Report the desktop GPU and, with "set", remember which one the next
+# login should use. Hyprland reads AQ_DRM_DEVICES only as it starts, so a
+# choice here does not move the running session.
+#
+# "brief" is safe to poll: it does not call nvidia-smi, which wakes the
+# discrete GPU. "status" adds names and NVIDIA power, for the open panel.
+#
+# Tests inject GPU_STATUS_* instead of reading this machine. They must set
+# XDG_CONFIG_HOME, or "set" would write the real login preference.
+
+set -euo pipefail
+
+mode_file() {
+  local config_home=${XDG_CONFIG_HOME:-$HOME/.config}
+  printf '%s\n' "$config_home/uwsm/gpu-mode"
+}
+
+clean_name() {
+  local text=$1
+  text=${text//$'\n'/ }
+  text=${text//$'\r'/ }
+  text=${text//$'\t'/ }
+  text=${text//</}
+  text=${text//>/}
+  text=${text//&/}
+  text=$(printf '%s' "$text" | tr -cd '[:print:]' | sed 's/^ *//;s/ *$//' | cut -c1-96)
+  printf '%s' "$text"
+}
+
+json_number() {
+  if [[ ${1:-} =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    printf '%s' "$1"
+  else
+    printf 'null'
+  fi
+}
+
+# Tests point these at a fake tree. The installed widget reads the real devices.
+dri_root() {
+  printf '%s' "${GPU_STATUS_DRI_ROOT:-/dev/dri}"
+}
+
+sys_drm() {
+  printf '%s' "${GPU_STATUS_SYS_DRM:-/sys/class/drm}"
+}
+
+card_vendor() {
+  local node=$1 sys resolved card vendor
+  sys=$(sys_drm)
+  resolved=$(readlink -f "$node" 2>/dev/null || true)
+  [[ -n $resolved ]] || return 0
+  card=$(basename "$resolved")
+  [[ $card =~ ^card[0-9]+$ ]] || return 0
+  [[ -r $sys/$card/device/vendor ]] || return 0
+  vendor=$(tr 'A-F' 'a-f' <"$sys/$card/device/vendor" | tr -d '[:space:]' || true)
+  printf '%s' "$vendor"
+}
+
+find_vendor_card() {
+  local want=$1 sys card vendor dev
+  sys=$(sys_drm)
+  shopt -s nullglob
+  for dev in "$sys"/card[0-9]*; do
+    card=$(basename "$dev")
+    [[ $card =~ ^card[0-9]+$ ]] || continue
+    [[ -r $dev/device/vendor ]] || continue
+    vendor=$(tr 'A-F' 'a-f' <"$dev/device/vendor" | tr -d '[:space:]' || true)
+    if [[ $vendor == "$want" ]]; then
+      shopt -u nullglob
+      printf '%s' "$card"
+      return 0
+    fi
+  done
+  shopt -u nullglob
+  return 1
+}
+
+read_preference() {
+  local file raw
+  file=$(mode_file)
+  preference=auto
+  [[ -f $file ]] || return 0
+  raw=$(head -c 16 "$file" 2>/dev/null || true)
+  case $raw in
+    intel*) preference=intel ;;
+    nvidia*) preference=nvidia ;;
+    auto*) preference=auto ;;
+  esac
+}
+
+write_preference() {
+  local mode=$1 file dir tmp
+  case $mode in
+    auto|intel|nvidia) ;;
+    *)
+      echo "gpu-status: mode must be auto, intel, or nvidia" >&2
+      return 2
+      ;;
+  esac
+  file=$(mode_file)
+  dir=$(dirname "$file")
+  mkdir -p "$dir"
+  tmp=$(mktemp "$dir/.gpu-mode.XXXXXX")
+  if ! printf '%s\n' "$mode" >"$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv -f "$tmp" "$file"
+}
+
+add_output() {
+  local conn=$1 gpu=$2 desktop=$3 count
+  [[ $conn =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || return 0
+  case $gpu in
+    intel|nvidia|other) ;;
+    *) return 0 ;;
+  esac
+  case $desktop in
+    0|1) ;;
+    *) desktop=0 ;;
+  esac
+  count=$(jq 'length' <<<"$outputs_json")
+  [[ $count -ge 8 ]] && return 0
+  outputs_json=$(jq -c \
+    --arg connector "$conn" \
+    --arg gpu "$gpu" \
+    --argjson desktop "$([[ $desktop == 1 ]] && echo true || echo false)" \
+    '. + [{connector:$connector, gpu:$gpu, desktop:$desktop}]' <<<"$outputs_json")
+}
+
+load_outputs() {
+  local row conn gpu desktop
+  outputs_json='[]'
+  nvidia_connected=0
+  if [[ -n ${GPU_STATUS_OUTPUTS+x} ]]; then
+    if jq -e 'type == "array"' <<<"$GPU_STATUS_OUTPUTS" >/dev/null 2>&1; then
+      while IFS= read -r row; do
+        [[ -n $row ]] || continue
+        conn=$(jq -r '.connector // ""' <<<"$row")
+        gpu=$(jq -r '.gpu // ""' <<<"$row")
+        desktop=$(jq -r 'if .desktop == true then 1 else 0 end' <<<"$row")
+        [[ $gpu == nvidia ]] && nvidia_connected=1
+        add_output "$conn" "$gpu" "$desktop"
+      done < <(jq -c '.[]' <<<"$GPU_STATUS_OUTPUTS")
+    fi
+    return 0
+  fi
+
+  local nv_real="" ig_real="" desktop_names=() name card conn_name real vendor state dir desk
+  [[ -e ${nv_card:-/dev/dri/nvidia-dgpu} ]] && nv_real=$(readlink -f "${nv_card:-/dev/dri/nvidia-dgpu}")
+  [[ -e ${ig_card:-/dev/dri/intel-igpu} ]] && ig_real=$(readlink -f "${ig_card:-/dev/dri/intel-igpu}")
+
+  if [[ -n ${GPU_STATUS_DESKTOP+x} ]]; then
+    IFS=',' read -r -a desktop_names <<<"$GPU_STATUS_DESKTOP"
+  elif command -v hyprctl >/dev/null 2>&1; then
+    while IFS= read -r name; do
+      [[ -n $name ]] && desktop_names+=("$name")
+    done < <(hyprctl monitors -j 2>/dev/null | jq -r '.[].name' 2>/dev/null || true)
+  fi
+
+  shopt -s nullglob
+  for state_path in /sys/class/drm/card*-*/status; do
+    state=$(cat "$state_path" 2>/dev/null || true)
+    [[ $state == connected ]] || continue
+    dir=$(basename "$(dirname "$state_path")")
+    card=${dir%%-*}
+    conn_name=${dir#*-}
+    [[ $conn_name == *riteback* ]] && continue
+    gpu=other
+    real=$(readlink -f "/dev/dri/$card" 2>/dev/null || true)
+    if [[ -n $nv_real && $real == "$nv_real" ]]; then
+      gpu=nvidia
+      nvidia_connected=1
+    elif [[ -n $ig_real && $real == "$ig_real" ]]; then
+      gpu=intel
+    else
+      vendor=$(cat "/sys/class/drm/$card/device/vendor" 2>/dev/null || true)
+      vendor=$(printf '%s' "$vendor" | tr 'A-F' 'a-f')
+      case $vendor in
+        0x10de)
+          gpu=nvidia
+          nvidia_connected=1
+          ;;
+        0x8086) gpu=intel ;;
+      esac
+    fi
+    desk=0
+    for name in "${desktop_names[@]}"; do
+      [[ $name == "$conn_name" ]] && desk=1
+    done
+    add_output "$conn_name" "$gpu" "$desk"
+  done
+  shopt -u nullglob
+}
+
+read_active() {
+  local pid aq first resolved nv_real="" ig_real="" vendor dri
+  active=unknown
+  dri=$(dri_root)
+  if [[ -n ${GPU_STATUS_ACTIVE:-} ]]; then
+    active=$GPU_STATUS_ACTIVE
+  else
+    aq=""
+    if [[ -n ${GPU_STATUS_AQ_DRM_DEVICES+x} ]]; then
+      aq=$GPU_STATUS_AQ_DRM_DEVICES
+    else
+      pid=$(pgrep -u "$(id -u)" -x Hyprland || true)
+      pid=${pid%%$'\n'*}
+      if [[ -n $pid && -r /proc/$pid/environ ]]; then
+        aq=$(tr '\0' '\n' <"/proc/$pid/environ" | sed -n 's/^AQ_DRM_DEVICES=//p' || true)
+      fi
+    fi
+    first=${aq%%:*}
+    [[ -e $dri/nvidia-dgpu ]] && nv_real=$(readlink -f "$dri/nvidia-dgpu")
+    [[ -e $dri/intel-igpu ]] && ig_real=$(readlink -f "$dri/intel-igpu")
+    if [[ -n $first ]]; then
+      resolved=$(readlink -f "$first" 2>/dev/null || printf '%s' "$first")
+      if [[ -n $nv_real && $resolved == "$nv_real" ]]; then
+        active=nvidia
+      elif [[ -n $ig_real && $resolved == "$ig_real" ]]; then
+        active=intel
+      else
+        # Other laptops have no nvidia-dgpu or intel-igpu symlink. The PCI
+        # vendor on the card node is enough, and reading it does not wake
+        # the discrete GPU.
+        vendor=$(card_vendor "$resolved")
+        case $vendor in
+          0x10de) active=nvidia ;;
+          0x8086) active=intel ;;
+          *)
+            if [[ $first == *nvidia* ]]; then
+              active=nvidia
+            elif [[ $first == *intel* ]]; then
+              active=intel
+            fi
+            ;;
+        esac
+      fi
+    fi
+  fi
+  case $active in
+    intel|nvidia|unknown) ;;
+    *) active=unknown ;;
+  esac
+}
+
+read_present() {
+  local dri
+  dri=$(dri_root)
+  if [[ -n ${GPU_STATUS_NVIDIA_PRESENT+x} ]]; then
+    nvidia_present=$GPU_STATUS_NVIDIA_PRESENT
+  elif [[ -e $dri/nvidia-dgpu ]] || find_vendor_card 0x10de >/dev/null; then
+    nvidia_present=1
+  else
+    nvidia_present=0
+  fi
+  if [[ -n ${GPU_STATUS_INTEL_PRESENT+x} ]]; then
+    intel_present=$GPU_STATUS_INTEL_PRESENT
+  elif [[ -e $dri/intel-igpu ]] || find_vendor_card 0x8086 >/dev/null; then
+    intel_present=1
+  else
+    intel_present=0
+  fi
+  case $nvidia_present in
+    0|1) ;;
+    *) nvidia_present=0 ;;
+  esac
+  case $intel_present in
+    0|1) ;;
+    *) intel_present=0 ;;
+  esac
+}
+
+read_names() {
+  local card slot line parsed
+  intel_name=""
+  nvidia_name=""
+  nvidia_util=""
+  nvidia_power=""
+  nvidia_mem=""
+  [[ ${detail:-0} == 1 ]] || return 0
+
+  if [[ -n ${GPU_STATUS_INTEL_NAME+x} ]]; then
+    intel_name=$GPU_STATUS_INTEL_NAME
+  else
+    card=""
+    if [[ -e $(dri_root)/intel-igpu ]]; then
+      card=$(basename "$(readlink -f "$(dri_root)/intel-igpu")")
+    else
+      card=$(find_vendor_card 0x8086 || true)
+    fi
+    if [[ -n $card ]] && command -v lspci >/dev/null 2>&1; then
+      slot=$(basename "$(readlink -f "$(sys_drm)/$card/device")" 2>/dev/null || true)
+      if [[ -n $slot ]]; then
+        intel_name=$(lspci -mm -s "$slot" 2>/dev/null | awk -F'"' '{print $6}' || true)
+      fi
+    fi
+  fi
+
+  if [[ -n ${GPU_STATUS_NVIDIA_CSV+x} ]]; then
+    line=$GPU_STATUS_NVIDIA_CSV
+  elif [[ $nvidia_present == 1 ]] && command -v nvidia-smi >/dev/null 2>&1; then
+    line=$(timeout 2 nvidia-smi --query-gpu=name,utilization.gpu,power.draw,memory.used --format=csv,noheader,nounits 2>/dev/null | head -n 1 || true)
+  else
+    line=""
+  fi
+  if [[ -n $line ]]; then
+    parsed=$(printf '%s\n' "$line" | awk -F',' '
+      NF < 4 { exit 1 }
+      {
+        name = $1
+        for (i = 2; i <= NF - 3; i++) name = name "," $i
+        gsub(/^[ \t]+|[ \t]+$/, "", name)
+        gsub(/^[ \t]+|[ \t]+$/, "", $(NF - 2))
+        gsub(/^[ \t]+|[ \t]+$/, "", $(NF - 1))
+        gsub(/^[ \t]+|[ \t]+$/, "", $NF)
+        print name
+        print $(NF - 2)
+        print $(NF - 1)
+        print $NF
+      }') || parsed=""
+    if [[ -n $parsed ]]; then
+      nvidia_name=$(printf '%s\n' "$parsed" | sed -n '1p')
+      nvidia_util=$(printf '%s\n' "$parsed" | sed -n '2p')
+      nvidia_power=$(printf '%s\n' "$parsed" | sed -n '3p')
+      nvidia_mem=$(printf '%s\n' "$parsed" | sed -n '4p')
+    fi
+  fi
+
+  intel_name=$(clean_name "$intel_name")
+  nvidia_name=$(clean_name "$nvidia_name")
+  # lspci reports "TigerLake-H GT1 [UHD Graphics]". The bracketed product
+  # name is the one a person recognizes.
+  if [[ $intel_name == *'['*']'* ]]; then
+    local inner=${intel_name#*[}
+    inner=${inner%]*}
+    inner=$(clean_name "$inner")
+    [[ -n $inner ]] && intel_name=$inner
+  fi
+}
+
+emit_status() {
+  local next=intel needs_logout=0
+  read_preference
+  read_present
+  read_active
+  load_outputs
+  if [[ -n ${GPU_STATUS_NV_CONNECTED+x} ]]; then
+    case $GPU_STATUS_NV_CONNECTED in
+      1) nvidia_connected=1 ;;
+      *) nvidia_connected=0 ;;
+    esac
+  fi
+  read_names
+
+  case $preference in
+    intel) next=intel ;;
+    nvidia) next=nvidia ;;
+    *)
+      if [[ $nvidia_connected == 1 ]]; then
+        next=nvidia
+      else
+        next=intel
+      fi
+      ;;
+  esac
+
+  if [[ $active == intel || $active == nvidia ]] && [[ $next != "$active" ]]; then
+    if [[ $next == nvidia && $nvidia_present == 1 ]]; then
+      needs_logout=1
+    elif [[ $next == intel && $intel_present == 1 ]]; then
+      needs_logout=1
+    fi
+  fi
+
+  jq -n \
+    --arg active "$active" \
+    --arg preference "$preference" \
+    --arg next "$next" \
+    --arg intelName "$intel_name" \
+    --arg nvidiaName "$nvidia_name" \
+    --argjson detail "$([[ ${detail:-0} == 1 ]] && echo true || echo false)" \
+    --argjson needsLogout "$([[ $needs_logout == 1 ]] && echo true || echo false)" \
+    --argjson intelPresent "$([[ $intel_present == 1 ]] && echo true || echo false)" \
+    --argjson nvidiaPresent "$([[ $nvidia_present == 1 ]] && echo true || echo false)" \
+    --argjson nvidiaConnected "$([[ $nvidia_connected == 1 ]] && echo true || echo false)" \
+    --argjson nvidiaUtil "$(json_number "$nvidia_util")" \
+    --argjson nvidiaPower "$(json_number "$nvidia_power")" \
+    --argjson nvidiaMem "$(json_number "$nvidia_mem")" \
+    --argjson outputs "$outputs_json" \
+    '{active:$active, preference:$preference, next:$next, intelName:$intelName,
+      nvidiaName:$nvidiaName, detail:$detail, needsLogout:$needsLogout,
+      intelPresent:$intelPresent, nvidiaPresent:$nvidiaPresent,
+      nvidiaConnected:$nvidiaConnected, nvidiaUtil:$nvidiaUtil,
+      nvidiaPower:$nvidiaPower, nvidiaMem:$nvidiaMem, outputs:$outputs}'
+}
+
+self_test() {
+  local tmp script json code
+  tmp=$(mktemp -d)
+  script=$(readlink -f "$0")
+  trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "$tmp/config/uwsm"
+
+  fail() {
+    echo "gpu-status self-test failed: $*" >&2
+    exit 1
+  }
+
+  assert_jq() {
+    local body=$1 filter=$2
+    if ! printf '%s' "$body" | jq -e "$filter" >/dev/null; then
+      echo "gpu-status self-test failed: $filter" >&2
+      printf '%s\n' "$body" >&2
+      exit 1
+    fi
+  }
+
+  json=$(
+    XDG_CONFIG_HOME="$tmp/config" \
+      GPU_STATUS_ACTIVE=intel \
+      GPU_STATUS_NV_CONNECTED=1 \
+      GPU_STATUS_NVIDIA_PRESENT=1 \
+      GPU_STATUS_INTEL_PRESENT=1 \
+      GPU_STATUS_INTEL_NAME='<b>UHD</b>' \
+      GPU_STATUS_NVIDIA_CSV='<img src="https://evil.invalid/t.png">&, 12, 19.5, 100' \
+      GPU_STATUS_OUTPUTS='[{"connector":"DP-3","gpu":"nvidia","desktop":true},{"connector":"<bad>","gpu":"intel"}]' \
+      bash "$script" status
+  )
+  assert_jq "$json" '.active == "intel" and .preference == "auto" and .next == "nvidia" and .needsLogout == true and .detail == true'
+  assert_jq "$json" '.nvidiaUtil == 12 and .nvidiaPower == 19.5 and .nvidiaMem == 100'
+  assert_jq "$json" '.outputs | length == 1 and .[0].connector == "DP-3" and .[0].desktop == true'
+  if printf '%s' "$json" | jq -r '.intelName, .nvidiaName, .outputs[].connector' | grep -q '[<>&]'; then
+    fail "markup survived in a name shown by the panel"
+  fi
+
+  printf '%s\n' intel >"$tmp/config/uwsm/gpu-mode"
+  json=$(
+    XDG_CONFIG_HOME="$tmp/config" \
+      GPU_STATUS_ACTIVE=nvidia \
+      GPU_STATUS_NV_CONNECTED=1 \
+      GPU_STATUS_NVIDIA_PRESENT=1 \
+      GPU_STATUS_INTEL_PRESENT=1 \
+      GPU_STATUS_OUTPUTS='[]' \
+      bash "$script" brief
+  )
+  assert_jq "$json" '.preference == "intel" and .next == "intel" and .needsLogout == true and .detail == false and .nvidiaUtil == null'
+
+  rm -f "$tmp/config/uwsm/gpu-mode"
+  json=$(
+    XDG_CONFIG_HOME="$tmp/config" \
+      GPU_STATUS_ACTIVE=intel \
+      GPU_STATUS_NV_CONNECTED=0 \
+      GPU_STATUS_NVIDIA_PRESENT=1 \
+      GPU_STATUS_INTEL_PRESENT=1 \
+      GPU_STATUS_OUTPUTS='[]' \
+      bash "$script" brief
+  )
+  assert_jq "$json" '.next == "intel" and .needsLogout == false'
+
+  json=$(
+    XDG_CONFIG_HOME="$tmp/config" \
+      GPU_STATUS_ACTIVE=intel \
+      GPU_STATUS_NV_CONNECTED=1 \
+      GPU_STATUS_NVIDIA_PRESENT=0 \
+      GPU_STATUS_INTEL_PRESENT=1 \
+      GPU_STATUS_OUTPUTS='[]' \
+      bash "$script" brief
+  )
+  assert_jq "$json" '.next == "nvidia" and .needsLogout == false and .nvidiaPresent == false'
+
+  set +e
+  XDG_CONFIG_HOME="$tmp/config" bash "$script" set 'intel;touch /tmp/gpu-widget-pwned' >/dev/null 2>&1
+  code=$?
+  set -e
+  [[ $code -ne 0 ]] || fail "rejected mode was accepted"
+  [[ ! -e /tmp/gpu-widget-pwned ]] || fail "mode was executed as a command"
+  if [[ -f $tmp/config/uwsm/gpu-mode ]] && [[ $(cat "$tmp/config/uwsm/gpu-mode") != intel && $(cat "$tmp/config/uwsm/gpu-mode") != auto && $(cat "$tmp/config/uwsm/gpu-mode") != nvidia ]]; then
+    fail "mode file contains an unexpected value"
+  fi
+
+  XDG_CONFIG_HOME="$tmp/config" \
+    GPU_STATUS_ACTIVE=intel \
+    GPU_STATUS_NV_CONNECTED=1 \
+    GPU_STATUS_NVIDIA_PRESENT=1 \
+    GPU_STATUS_INTEL_PRESENT=1 \
+    GPU_STATUS_OUTPUTS='[]' \
+    bash "$script" set intel >/dev/null
+  [[ $(cat "$tmp/config/uwsm/gpu-mode") == intel ]] || fail "set intel did not stick"
+  json=$(
+    XDG_CONFIG_HOME="$tmp/config" \
+      GPU_STATUS_ACTIVE=intel \
+      GPU_STATUS_NV_CONNECTED=1 \
+      GPU_STATUS_NVIDIA_PRESENT=1 \
+      GPU_STATUS_INTEL_PRESENT=1 \
+      GPU_STATUS_OUTPUTS='[]' \
+      bash "$script" brief
+  )
+  assert_jq "$json" '.preference == "intel" and .next == "intel" and .needsLogout == false'
+
+  mkdir -p "$tmp/sys/card0/device" "$tmp/sys/card1/device" "$tmp/dri"
+  printf '0x8086\n' >"$tmp/sys/card0/device/vendor"
+  printf '0x10DE\n' >"$tmp/sys/card1/device/vendor"
+  touch "$tmp/dri/card0" "$tmp/dri/card1"
+  json=$(
+    XDG_CONFIG_HOME="$tmp/config" \
+      GPU_STATUS_DRI_ROOT="$tmp/dri" \
+      GPU_STATUS_SYS_DRM="$tmp/sys" \
+      GPU_STATUS_AQ_DRM_DEVICES="$tmp/dri/card1:$tmp/dri/card0" \
+      GPU_STATUS_NV_CONNECTED=0 \
+      GPU_STATUS_NVIDIA_PRESENT=1 \
+      GPU_STATUS_INTEL_PRESENT=1 \
+      GPU_STATUS_OUTPUTS='[]' \
+      bash "$script" brief
+  )
+  assert_jq "$json" '.active == "nvidia"'
+  json=$(
+    XDG_CONFIG_HOME="$tmp/config" \
+      GPU_STATUS_DRI_ROOT="$tmp/dri" \
+      GPU_STATUS_SYS_DRM="$tmp/sys" \
+      GPU_STATUS_AQ_DRM_DEVICES="$tmp/dri/card0" \
+      GPU_STATUS_NV_CONNECTED=0 \
+      GPU_STATUS_NVIDIA_PRESENT=1 \
+      GPU_STATUS_INTEL_PRESENT=1 \
+      GPU_STATUS_OUTPUTS='[]' \
+      bash "$script" brief
+  )
+  assert_jq "$json" '.active == "intel"'
+  printf '0x1002\n' >"$tmp/sys/card0/device/vendor"
+  json=$(
+    XDG_CONFIG_HOME="$tmp/config" \
+      GPU_STATUS_DRI_ROOT="$tmp/dri" \
+      GPU_STATUS_SYS_DRM="$tmp/sys" \
+      GPU_STATUS_AQ_DRM_DEVICES="$tmp/dri/card0" \
+      GPU_STATUS_NV_CONNECTED=0 \
+      GPU_STATUS_NVIDIA_PRESENT=0 \
+      GPU_STATUS_INTEL_PRESENT=0 \
+      GPU_STATUS_OUTPUTS='[]' \
+      bash "$script" brief
+  )
+  assert_jq "$json" '.active == "unknown"'
+  touch "$tmp/dri/nvidia-dgpu"
+  json=$(
+    XDG_CONFIG_HOME="$tmp/config" \
+      GPU_STATUS_DRI_ROOT="$tmp/dri" \
+      GPU_STATUS_SYS_DRM="$tmp/sys" \
+      GPU_STATUS_AQ_DRM_DEVICES="$tmp/dri/nvidia-dgpu" \
+      GPU_STATUS_NV_CONNECTED=0 \
+      GPU_STATUS_NVIDIA_PRESENT=1 \
+      GPU_STATUS_INTEL_PRESENT=1 \
+      GPU_STATUS_OUTPUTS='[]' \
+      bash "$script" brief
+  )
+  assert_jq "$json" '.active == "nvidia"'
+
+  rm -rf "$tmp/sys" "$tmp/dri"
+  mkdir -p "$tmp/sys/card2/device" "$tmp/empty-dri"
+  printf '0x8086\n' >"$tmp/sys/card2/device/vendor"
+  json=$(
+    XDG_CONFIG_HOME="$tmp/config" \
+      GPU_STATUS_DRI_ROOT="$tmp/empty-dri" \
+      GPU_STATUS_SYS_DRM="$tmp/sys" \
+      GPU_STATUS_ACTIVE=intel \
+      GPU_STATUS_NV_CONNECTED=0 \
+      GPU_STATUS_OUTPUTS='[]' \
+      bash "$script" brief
+  )
+  assert_jq "$json" '.intelPresent == true and .nvidiaPresent == false'
+
+  if command -v node >/dev/null 2>&1; then
+    node -e '
+const fs = require("fs")
+const vm = require("vm")
+const sandbox = {}
+vm.createContext(sandbox)
+vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), sandbox)
+if (typeof sandbox.plain !== "function") process.exit(1)
+const dirty = sandbox.plain("<img src=\"https://evil.invalid/t.png\">&")
+if (/[<>&]/.test(dirty)) process.exit(1)
+if (sandbox.plain("RTX 3080") !== "RTX 3080") process.exit(1)
+if (sandbox.plain(null) !== "") process.exit(1)
+if (sandbox.plain("x".repeat(200)).length !== 96) process.exit(1)
+' "$(dirname "$script")/Model.js" || fail "Model.plain kept markup"
+  else
+    fail "node is required to test Model.plain"
+  fi
+
+  echo "gpu-status self-test ok"
+}
+
+command=${1:-brief}
+case $command in
+  --self-test)
+    self_test
+    ;;
+  brief)
+    detail=0
+    emit_status
+    ;;
+  status)
+    detail=1
+    emit_status
+    ;;
+  set)
+    write_preference "${2:-}"
+    detail=0
+    emit_status
+    ;;
+  *)
+    echo "usage: gpu-status [brief|status|set auto|intel|nvidia|--self-test]" >&2
+    exit 2
+    ;;
+esac
