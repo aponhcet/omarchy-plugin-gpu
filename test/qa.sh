@@ -24,6 +24,9 @@ link=$(find . -name .git -prune -o -type l -print -quit)
 
 jq -e '.schemaVersion == 1 and .id == "aponhcet.gpu" and .version == "1.4.0"' manifest.json >/dev/null \
   || fail "manifest id, schema, or version"
+version=$(jq -r .version manifest.json)
+[[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "version must be major.minor.patch"
+grep -qx "## $version" CHANGELOG.md || fail "CHANGELOG.md has no section for $version"
 jq -e '(.kinds | index("bar-widget")) != null and .entryPoints.barWidget == "Panel.qml"' manifest.json >/dev/null \
   || fail "manifest must load Panel.qml as a bar widget"
 [[ -f LICENSE && -f README.md && -f preview.png ]] || fail "missing LICENSE, README, or preview.png"

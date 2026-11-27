@@ -152,6 +152,16 @@ bash test/qa.sh
 
 The suite runs in temporary directories. It does not read or write your login GPU, your per-app choices, or the running session. It checks the manifest, the English catalog, plain-text rendering, animation timing, poisoned names, and the launcher files. On Omarchy it also runs `omarchy plugin validate`. GitHub runs the same suite on every push.
 
+## Release
+
+`manifest.json` is the version. `test/qa.sh` requires that same `major.minor.patch` value, and a `CHANGELOG.md` section with that heading.
+
+1. Set the manifest, the assertion in `test/qa.sh`, and the changelog section to the new version.
+2. Push to `main` and wait until the test workflow is green on that commit.
+3. Tag that commit `vX.Y.Z` and push the tag.
+
+The release workflow runs the same checks, refuses a tag that does not match the manifest, and publishes the GitHub release from the changelog section. It does not change the branch.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
