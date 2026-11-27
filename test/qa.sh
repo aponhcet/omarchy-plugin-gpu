@@ -17,12 +17,20 @@ command -v python3 >/dev/null 2>&1 || fail "python3 is required"
 
 bash -n gpu-status
 bash -n gpu-launch
-[[ -x gpu-status && -x gpu-launch ]] || fail "gpu-status and gpu-launch must be executable"
+bash -n gpu-install
+bash -n login.sh
+[[ -x gpu-status && -x gpu-launch && -x gpu-install ]] || fail "gpu-status, gpu-launch, and gpu-install must be executable"
+[[ ! -x login.sh ]] || fail "login.sh is copied into the login file and must not be executable"
+[[ $(head -n1 login.sh) == '# aponhcet.gpu login' ]] || fail "login.sh must start with its marker"
+[[ $(tail -n1 login.sh) == '# aponhcet.gpu login end' ]] || fail "login.sh must end with its marker"
+if grep -E -n 'sudo|pkexec|systemctl|curl|wget' login.sh gpu-install README.md Panel.qml; then
+  fail "installer text names a privileged or downloaded command"
+fi
 
 link=$(find . -name .git -prune -o -type l -print -quit)
 [[ -z $link ]] || fail "symlink inside the plugin: $link"
 
-jq -e '.schemaVersion == 1 and .id == "aponhcet.gpu" and .version == "1.5.0"' manifest.json >/dev/null \
+jq -e '.schemaVersion == 1 and .id == "aponhcet.gpu" and .version == "1.6.0"' manifest.json >/dev/null \
   || fail "manifest id, schema, or version"
 version=$(jq -r .version manifest.json)
 [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "version must be major.minor.patch"
@@ -32,6 +40,12 @@ jq -e '(.kinds | index("bar-widget")) != null and .entryPoints.barWidget == "Pan
 [[ -f LICENSE && -f README.md && -f preview.png ]] || fail "missing LICENSE, README, or preview.png"
 grep -q '^## Install' README.md || fail "README needs an Install section"
 grep -q '^## Remove' README.md || fail "README needs a Remove section"
+grep -q 'omarchy plugin add https://github.com/aponhcet/omarchy-plugin-gpu.git --enable' README.md \
+  || fail "README install command"
+if grep -F -q 'does not edit any other file' README.md; then
+  fail "README still says the widget does not edit the login file"
+fi
+grep -q 'login.sh' README.md || fail "README must name login.sh"
 
 python3 - "$root" <<'PY'
 import json, pathlib, re, sys
@@ -102,6 +116,7 @@ for raw in panel.splitlines(True):
 PY
 
 bash gpu-status --self-test
+bash gpu-install --self-test
 
 if command -v omarchy >/dev/null 2>&1; then
   omarchy plugin validate "$root"

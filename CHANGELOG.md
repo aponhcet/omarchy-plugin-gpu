@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.6.0
+
+Installing the widget is one command. `omarchy plugin add` is enough: the plugin writes the login rule into `~/.config/uwsm/env-hyprland` when that file does not already choose a desktop GPU.
+
+A file that already exports `AQ_DRM_DEVICES` is left as it is. Logging out is still what moves the desktop. Removing the widget leaves the login file in place.
+
 ## 1.5.0
 
 AMD is now a desktop choice and a per-app choice, beside Intel and NVIDIA.

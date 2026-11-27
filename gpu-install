@@ -1,0 +1,264 @@
+#!/bin/bash
+
+# Copy login.sh into the Hyprland login file when that file does not already
+# mention AQ_DRM_DEVICES. A block marked for this widget is refreshed in
+# place. login.sh is copied as text and is not executed here. gpu-mode and
+# gpu-apps are left untouched: those files are written only when a choice
+# is clicked.
+
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+login_src=$here/login.sh
+begin='# aponhcet.gpu login'
+end='# aponhcet.gpu login end'
+
+env_file() {
+  local config_home=${XDG_CONFIG_HOME:-$HOME/.config}
+  printf '%s\n' "$config_home/uwsm/env-hyprland"
+}
+
+# 0 match, 1 no match, 2 could not read. A read error must not become a write.
+grep_fixed() {
+  local file=$1
+  local needle=$2
+  local whole_line=${3:-}
+  local status=0
+  if [[ $whole_line == line ]]; then
+    grep -qxF "$needle" "$file" || status=$?
+  else
+    grep -qF "$needle" "$file" || status=$?
+  fi
+  printf '%s\n' "$status"
+}
+
+require_snippet() {
+  [[ -f $login_src ]] || return 1
+  [[ $(grep_fixed "$login_src" "$begin" line) -eq 0 ]] || return 1
+  [[ $(grep_fixed "$login_src" "$end" line) -eq 0 ]] || return 1
+}
+
+# Replace target with the bytes on stdin. The temporary file is in the same
+# directory, so the rename is atomic. The RETURN trap removes it if the
+# rename does not happen.
+commit_target() {
+  local target=$1
+  local mode=$2
+  local dir tmp
+  dir=$(dirname -- "$target")
+  mkdir -p -- "$dir"
+  tmp=$(mktemp "$dir/.env-hyprland.XXXXXX")
+  trap 'rm -f -- "$tmp"' RETURN
+  cat >"$tmp"
+  [[ -s $tmp ]]
+  chmod -- "$mode" "$tmp"
+  mv -f -- "$tmp" "$target"
+  trap - RETURN
+}
+
+refresh_block() {
+  local target=$1
+  local mode rendered
+  mode=$(stat -c %a -- "$target")
+  rendered=$(mktemp)
+  trap 'rm -f -- "$rendered"' RETURN
+  LOGIN_SRC=$login_src awk -v begin="$begin" -v end="$end" '
+    BEGIN {
+      src = ENVIRON["LOGIN_SRC"]
+      while ((getline line < src) > 0) block = block line ORS
+      close(src)
+      if (block == "") exit 2
+    }
+    $0 == begin {
+      printf "%s", block
+      skipping = 1
+      next
+    }
+    skipping && $0 == end {
+      skipping = 0
+      next
+    }
+    skipping { next }
+    { print }
+  ' "$target" >"$rendered"
+  commit_target "$target" "$mode" <"$rendered"
+  rm -f -- "$rendered"
+  trap - RETURN
+}
+
+append_block() {
+  local target=$1
+  local mode rendered lastbyte
+  mode=$(stat -c %a -- "$target")
+  rendered=$(mktemp)
+  trap 'rm -f -- "$rendered"' RETURN
+  cat -- "$target" >"$rendered"
+  if [[ -s $target ]]; then
+    lastbyte=$(tail -c1 -- "$target" || true)
+    # Command substitution drops a trailing newline, so a non-empty result
+    # means the file did not already end with one.
+    if [[ -n $lastbyte ]]; then
+      printf '\n' >>"$rendered"
+    fi
+  fi
+  cat -- "$login_src" >>"$rendered"
+  commit_target "$target" "$mode" <"$rendered"
+  rm -f -- "$rendered"
+  trap - RETURN
+}
+
+create_block() {
+  local target=$1
+  commit_target "$target" 600 <"$login_src"
+}
+
+install_login() {
+  local target status
+  require_snippet
+  target=$(env_file)
+  # A symlink is left alone, including one whose destination is missing.
+  # Replacing it would write through to the other file.
+  if [[ -L $target ]]; then
+    return 0
+  fi
+  if [[ -e $target && ! -f $target ]]; then
+    return 0
+  fi
+  if [[ -f $target ]]; then
+    status=$(grep_fixed "$target" "$begin" line)
+    if [[ $status -eq 2 ]]; then
+      return 0
+    fi
+    if [[ $status -eq 0 ]]; then
+      refresh_block "$target"
+      return 0
+    fi
+    status=$(grep_fixed "$target" 'AQ_DRM_DEVICES')
+    if [[ $status -eq 0 || $status -eq 2 ]]; then
+      return 0
+    fi
+    append_block "$target"
+    return 0
+  fi
+  create_block "$target"
+}
+
+assert_block() {
+  local file=$1
+  [[ $(grep -cxF "$begin" "$file") -eq 1 ]]
+  [[ $(grep -cxF "$end" "$file") -eq 1 ]]
+  grep -qF 'export AQ_DRM_DEVICES' "$file"
+  grep -qF '0x1002' "$file"
+  awk -v begin="$begin" -v end="$end" '
+    $0 == begin { printing = 1 }
+    printing { print }
+    $0 == end { exit }
+  ' "$file" | cmp -s - "$login_src"
+}
+
+self_test() {
+  (
+    set -euo pipefail
+    local root file before
+    root=$(mktemp -d)
+    trap 'rm -rf -- "$root"' EXIT
+    export XDG_CONFIG_HOME=$root/hold
+
+    run_install() {
+      local target
+      target=$(env_file)
+      case $target in
+        "$root"/*) ;;
+        *)
+          printf 'gpu-install: self-test left the temporary directory\n' >&2
+          exit 1
+          ;;
+      esac
+      install_login
+    }
+
+    XDG_CONFIG_HOME=$root/missing
+    run_install
+    file=$root/missing/uwsm/env-hyprland
+    [[ -f $file ]]
+    cmp -s "$file" "$login_src"
+    assert_block "$file"
+    [[ $(stat -c %a -- "$file") == 600 ]]
+    cp -a -- "$file" "$root/missing-before"
+    run_install
+    cmp -s "$file" "$root/missing-before"
+    [[ $(find "$root/missing/uwsm" -name '.env-hyprland.*' | wc -l) -eq 0 ]]
+
+    XDG_CONFIG_HOME=$root/foreign
+    mkdir -p -- "$XDG_CONFIG_HOME/uwsm"
+    file=$XDG_CONFIG_HOME/uwsm/env-hyprland
+    printf 'sentinel\nexport AQ_DRM_DEVICES=keep\n' >"$file"
+    cp -a -- "$file" "$root/foreign-before"
+    run_install
+    cmp -s "$file" "$root/foreign-before"
+    [[ $(find "$root/foreign/uwsm" -name '.env-hyprland.*' | wc -l) -eq 0 ]]
+
+    XDG_CONFIG_HOME=$root/comment
+    mkdir -p -- "$XDG_CONFIG_HOME/uwsm"
+    file=$XDG_CONFIG_HOME/uwsm/env-hyprland
+    printf 'sentinel-comment\n# AQ_DRM_DEVICES stays in a comment\n' >"$file"
+    cp -a -- "$file" "$root/comment-before"
+    run_install
+    cmp -s "$file" "$root/comment-before"
+
+    XDG_CONFIG_HOME=$root/marked
+    mkdir -p -- "$XDG_CONFIG_HOME/uwsm"
+    file=$XDG_CONFIG_HOME/uwsm/env-hyprland
+    printf 'kept-before\n%s\nOLD\n%s\nkept-after\n' "$begin" "$end" >"$file"
+    chmod -- 640 "$file"
+    run_install
+    grep -qxF 'kept-before' "$file"
+    grep -qxF 'kept-after' "$file"
+    if grep -qxF 'OLD' "$file"; then
+      printf 'gpu-install: stale login block remained\n' >&2
+      exit 1
+    fi
+    assert_block "$file"
+    [[ $(stat -c %a -- "$file") == 640 ]]
+    cp -a -- "$file" "$root/marked-before"
+    run_install
+    cmp -s "$file" "$root/marked-before"
+
+    XDG_CONFIG_HOME=$root/append
+    mkdir -p -- "$XDG_CONFIG_HOME/uwsm"
+    file=$XDG_CONFIG_HOME/uwsm/env-hyprland
+    printf 'kept-append' >"$file"
+    chmod -- 640 "$file"
+    run_install
+    grep -qxF 'kept-append' "$file"
+    assert_block "$file"
+    [[ $(stat -c %a -- "$file") == 640 ]]
+    cp -a -- "$file" "$root/append-before"
+    run_install
+    cmp -s "$file" "$root/append-before"
+
+    XDG_CONFIG_HOME=$root/link
+    mkdir -p -- "$XDG_CONFIG_HOME/uwsm" "$root/link-real"
+    printf 'link-sentinel\nexport AQ_DRM_DEVICES=keep\n' >"$root/link-real/env"
+    ln -s -- "$root/link-real/env" "$XDG_CONFIG_HOME/uwsm/env-hyprland"
+    cp -a -- "$root/link-real/env" "$root/link-before"
+    run_install
+    [[ -L $XDG_CONFIG_HOME/uwsm/env-hyprland ]]
+    cmp -s "$root/link-real/env" "$root/link-before"
+
+    if find "$root" \( -name gpu-mode -o -name gpu-apps -o -name '.env-hyprland.*' \) | grep -q .; then
+      printf 'gpu-install: self-test left a mode file or a temporary file\n' >&2
+      exit 1
+    fi
+  )
+  printf 'gpu-install self-test ok\n'
+}
+
+case ${1:-} in
+  install) install_login ;;
+  --self-test) self_test ;;
+  *)
+    printf 'usage: gpu-install install|--self-test\n' >&2
+    exit 2
+    ;;
+esac

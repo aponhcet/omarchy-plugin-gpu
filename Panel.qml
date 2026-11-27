@@ -17,6 +17,7 @@ Panel {
   // discrete GPU out of runtime suspend, so the detailed read runs only
   // while this panel is open.
   readonly property string scriptPath: decodeScript(Qt.resolvedUrl("gpu-status"))
+  readonly property string installPath: decodeScript(Qt.resolvedUrl("gpu-install"))
   property string active: "unknown"
   property string preference: "auto"
   property string next: "unknown"
@@ -298,7 +299,13 @@ Panel {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  Component.onCompleted: refresh()
+  Component.onCompleted: {
+    if (installPath !== "") {
+      loginInstall.command = ["bash", installPath, "install"]
+      loginInstall.running = true
+    }
+    refresh()
+  }
 
   onOpenedChanged: {
     logoutArmed = false
@@ -333,6 +340,12 @@ Panel {
     repeat: true
     running: true
     onTriggered: root.refresh()
+  }
+
+  Process {
+    id: loginInstall
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
   }
 
   Process {
