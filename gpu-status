@@ -7,7 +7,8 @@
 # "brief" is safe to poll: it does not call nvidia-smi, which wakes the
 # discrete GPU, and it does not inspect apps. "status" adds names, NVIDIA
 # power, and the app list for the open panel. "set-app" remembers Desktop,
-# Intel, or NVIDIA for the next start of one program.
+# Intel, NVIDIA, or AMD for the next start of one program. AMD has no
+# power reading here: the open panel shows its PCI name only.
 #
 # Tests inject GPU_STATUS_* instead of reading this machine. They must set
 # XDG_CONFIG_HOME, or "set" would write the real login preference.
@@ -37,6 +38,21 @@ json_number() {
   else
     printf 'null'
   fi
+}
+
+# lspci reports "Navi 22 [Radeon RX 6700 XT]". The bracketed product name
+# is the one a person recognizes. NVIDIA names come from nvidia-smi and
+# stay whole.
+product_name() {
+  local name inner
+  name=$(clean_name "$1")
+  if [[ $name == *'['*']'* ]]; then
+    inner=${name#*[}
+    inner=${inner%]*}
+    inner=$(clean_name "$inner")
+    [[ -n $inner ]] && name=$inner
+  fi
+  printf '%s' "$name"
 }
 
 # Tests point these at a fake tree. The installed widget reads the real devices.
@@ -88,6 +104,7 @@ read_preference() {
   case $raw in
     intel*) preference=intel ;;
     nvidia*) preference=nvidia ;;
+    amd*) preference=amd ;;
     auto*) preference=auto ;;
   esac
 }
@@ -95,9 +112,9 @@ read_preference() {
 write_preference() {
   local mode=$1 file dir tmp
   case $mode in
-    auto|intel|nvidia) ;;
+    auto|intel|nvidia|amd) ;;
     *)
-      echo "gpu-status: mode must be auto, intel, or nvidia" >&2
+      echo "gpu-status: mode must be auto, intel, nvidia, or amd" >&2
       return 2
       ;;
   esac
@@ -280,7 +297,7 @@ each_pin_line() {
   file=$(apps_file)
   [[ -f $file ]] || return 0
   while IFS= read -r line || [[ -n $line ]]; do
-    [[ $line =~ ^([a-z0-9][a-z0-9._+-]{0,40})[[:space:]]+(intel|nvidia)[[:space:]]+(/[^[:space:]]+)[[:space:]]+([^[:space:]]+)$ ]] || continue
+    [[ $line =~ ^([a-z0-9][a-z0-9._+-]{0,40})[[:space:]]+(intel|nvidia|amd)[[:space:]]+(/[^[:space:]]+)[[:space:]]+([^[:space:]]+)$ ]] || continue
     printf '%s\n' "$line"
   done <"$file"
 }
@@ -337,7 +354,7 @@ lookup_pin() {
   pin_binary=""
   pin_desktop="-"
   while IFS= read -r line; do
-    [[ $line =~ ^([a-z0-9][a-z0-9._+-]{0,40})[[:space:]]+(intel|nvidia)[[:space:]]+(/[^[:space:]]+)[[:space:]]+([^[:space:]]+)$ ]] || continue
+    [[ $line =~ ^([a-z0-9][a-z0-9._+-]{0,40})[[:space:]]+(intel|nvidia|amd)[[:space:]]+(/[^[:space:]]+)[[:space:]]+([^[:space:]]+)$ ]] || continue
     [[ ${BASH_REMATCH[1]} == "$want" ]] || continue
     pin_mode=${BASH_REMATCH[2]}
     pin_binary=${BASH_REMATCH[3]}
@@ -353,9 +370,9 @@ set_app() {
     return 2
   }
   case $mode in
-    desktop | intel | nvidia) ;;
+    desktop | intel | nvidia | amd) ;;
     *)
-      echo "gpu-status: app mode must be desktop, intel, or nvidia" >&2
+      echo "gpu-status: app mode must be desktop, intel, nvidia, or amd" >&2
       return 2
       ;;
   esac
@@ -418,12 +435,13 @@ app_label() {
 }
 
 add_app() {
-  local id=$1 name=$2 gpu=$3 count existing
+  local id=$1 name=$2 gpu=$3 vendors=${4:-} count existing vendors_json
   [[ -n $name ]] || return 0
   case $gpu in
-    intel | nvidia | both | none) ;;
+    intel | nvidia | amd | both | none) ;;
     *) return 0 ;;
   esac
+  vendors_json=$(jq -nc --arg v "$vendors" '$v | split(",") | map(select(. == "intel" or . == "nvidia" or . == "amd")) | unique')
   valid_app_id "$id" || id=""
   if [[ -n $id ]]; then
     existing=$(jq -r --arg id "$id" 'map(select(.id == $id)) | .[0].gpu // ""' <<<"$apps_json")
@@ -441,24 +459,24 @@ add_app() {
       fi
     fi
     if [[ -n $id ]]; then
-      apps_json=$(jq -c --arg id "$id" --arg gpu "$gpu" \
-        'map(if .id == $id then .gpu = $gpu else . end)' <<<"$apps_json")
+      apps_json=$(jq -c --arg id "$id" --arg gpu "$gpu" --argjson vendors "$vendors_json" \
+        'map(if .id == $id then .gpu = $gpu | .vendors = ((.vendors // []) + $vendors | unique) else . end)' <<<"$apps_json")
     else
-      apps_json=$(jq -c --arg name "$name" --arg gpu "$gpu" \
-        'map(if .id == "" and .name == $name then .gpu = $gpu else . end)' <<<"$apps_json")
+      apps_json=$(jq -c --arg name "$name" --arg gpu "$gpu" --argjson vendors "$vendors_json" \
+        'map(if .id == "" and .name == $name then .gpu = $gpu | .vendors = ((.vendors // []) + $vendors | unique) else . end)' <<<"$apps_json")
     fi
     return 0
   fi
   count=$(jq 'length' <<<"$apps_json")
   [[ $count -ge 8 ]] && return 0
-  apps_json=$(jq -c --arg id "$id" --arg name "$name" --arg gpu "$gpu" \
-    '. + [{id:$id, name:$name, gpu:$gpu}]' <<<"$apps_json")
+  apps_json=$(jq -c --arg id "$id" --arg name "$name" --arg gpu "$gpu" --argjson vendors "$vendors_json" \
+    '. + [{id:$id, name:$name, gpu:$gpu, vendors:$vendors}]' <<<"$apps_json")
 }
 
 merge_saved_apps() {
   local line id label
   while IFS= read -r line; do
-    [[ $line =~ ^([a-z0-9][a-z0-9._+-]{0,40})[[:space:]]+(intel|nvidia)[[:space:]]+ ]] || continue
+    [[ $line =~ ^([a-z0-9][a-z0-9._+-]{0,40})[[:space:]]+(intel|nvidia|amd)[[:space:]]+ ]] || continue
     id=${BASH_REMATCH[1]}
     if jq -e --arg id "$id" 'any(.[]; .id == $id)' <<<"$apps_json" >/dev/null; then
       continue
@@ -470,13 +488,14 @@ merge_saved_apps() {
 }
 
 annotate_apps() {
-  local row id name gpu launchable attached dest out stored
+  local row id name gpu launchable attached dest out stored vendors
   out='[]'
   while IFS= read -r row; do
     [[ -n $row ]] || continue
     id=$(jq -r '.id // ""' <<<"$row")
     name=$(jq -r '.name // ""' <<<"$row")
     gpu=$(jq -r '.gpu // ""' <<<"$row")
+    vendors=$(jq -c 'if (.vendors | type) == "array" then [.vendors[] | select(. == "intel" or . == "nvidia" or . == "amd")] else [] end' <<<"$row")
     lookup_pin "$id"
     launchable=false
     stored=$pin_binary
@@ -495,9 +514,10 @@ annotate_apps() {
       --arg name "$name" \
       --arg gpu "$gpu" \
       --arg preference "$pin_mode" \
+      --argjson vendors "$vendors" \
       --argjson launchable "$launchable" \
       --argjson attached "$attached" \
-      '. + [{id:$id, name:$name, gpu:$gpu, preference:$preference, launchable:$launchable, attached:$attached}]' <<<"$out")
+      '. + [{id:$id, name:$name, gpu:$gpu, vendors:$vendors, preference:$preference, launchable:$launchable, attached:$attached}]' <<<"$out")
   done < <(jq -c '.[]' <<<"$apps_json")
   apps_json=$out
 }
@@ -518,28 +538,29 @@ gpu_holdings() {
 }
 
 load_apps() {
+  local row name gpu label id vendors
   apps_json='[]'
   [[ ${detail:-0} == 1 ]] || return 0
   if [[ -n ${GPU_STATUS_APPS+x} ]]; then
-    local row name gpu label id
     if jq -e 'type == "array"' <<<"$GPU_STATUS_APPS" >/dev/null 2>&1; then
       while IFS= read -r row; do
         [[ -n $row ]] || continue
         name=$(jq -r '.name // ""' <<<"$row")
         gpu=$(jq -r '.gpu // ""' <<<"$row")
         id=$(jq -r '.id // ""' <<<"$row")
+        vendors=$(jq -r 'if (.vendors | type) == "array" then [.vendors[] | select(. == "intel" or . == "nvidia" or . == "amd")] | join(",") else "" end' <<<"$row")
         label=$(app_label "$name")
         if [[ -z $id || $id == null ]]; then
           id=$(comm_id "$label")
         fi
-        add_app "$id" "$label" "$gpu"
+        add_app "$id" "$label" "$gpu" "$vendors"
       done < <(jq -c '.[]' <<<"$GPU_STATUS_APPS")
     fi
   # Hermetic tests set GPU_STATUS_ACTIVE and must not inspect this machine.
   elif [[ -z ${GPU_STATUS_ACTIVE+x} ]]; then
 
   local -A render_gpu=() client_comm=()
-  local path base vendor pid target node gpu nv ig comm label label_comm parent cur i uid app_id
+  local path base vendor pid target node gpu nv ig amd comm label label_comm parent cur i uid app_id
   local -a mine theirs
   local holding found inherited self_comm best
   uid=$(id -u)
@@ -551,6 +572,7 @@ load_apps() {
     case $vendor in
       0x10de) render_gpu[$base]=nvidia ;;
       0x8086) render_gpu[$base]=intel ;;
+      0x1002) render_gpu[$base]=amd ;;
     esac
   done
 
@@ -586,6 +608,7 @@ load_apps() {
     fi
     nv=0
     ig=0
+    amd=0
     for holding in "${mine[@]}"; do
       base=$(basename "$holding")
       case $base in
@@ -593,13 +616,14 @@ load_apps() {
           gpu=${render_gpu[$base]:-}
           [[ $gpu == nvidia ]] && nv=1
           [[ $gpu == intel ]] && ig=1
+          [[ $gpu == amd ]] && amd=1
           ;;
         nvidia*)
           nv=1
           ;;
       esac
     done
-    [[ $nv == 0 && $ig == 0 ]] && continue
+    [[ $nv == 0 && $ig == 0 && $amd == 0 ]] && continue
 
     cur=$pid
     label=""
@@ -645,12 +669,18 @@ load_apps() {
     fi
     [[ -n $label ]] || continue
     app_id=$(comm_id "$label_comm")
-    if [[ $nv == 1 && $ig == 1 ]]; then
-      add_app "$app_id" "$label" both
+    vendors=""
+    [[ $ig == 1 ]] && vendors=intel
+    [[ $nv == 1 ]] && vendors=${vendors:+$vendors,}nvidia
+    [[ $amd == 1 ]] && vendors=${vendors:+$vendors,}amd
+    if [[ $nv == 1 && $ig == 1 ]] || [[ $nv == 1 && $amd == 1 ]] || [[ $ig == 1 && $amd == 1 ]]; then
+      add_app "$app_id" "$label" both "$vendors"
     elif [[ $nv == 1 ]]; then
-      add_app "$app_id" "$label" nvidia
+      add_app "$app_id" "$label" nvidia "$vendors"
+    elif [[ $amd == 1 ]]; then
+      add_app "$app_id" "$label" amd "$vendors"
     else
-      add_app "$app_id" "$label" intel
+      add_app "$app_id" "$label" intel "$vendors"
     fi
   done < <(ps -u "$uid" -o pid=)
   shopt -u nullglob
@@ -664,7 +694,7 @@ add_output() {
   local conn=$1 gpu=$2 desktop=$3 count
   [[ $conn =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || return 0
   case $gpu in
-    intel|nvidia|other) ;;
+    intel|nvidia|amd|other) ;;
     *) return 0 ;;
   esac
   case $desktop in
@@ -684,6 +714,7 @@ load_outputs() {
   local row conn gpu desktop
   outputs_json='[]'
   nvidia_connected=0
+  amd_connected=0
   if [[ -n ${GPU_STATUS_OUTPUTS+x} ]]; then
     if jq -e 'type == "array"' <<<"$GPU_STATUS_OUTPUTS" >/dev/null 2>&1; then
       while IFS= read -r row; do
@@ -692,15 +723,18 @@ load_outputs() {
         gpu=$(jq -r '.gpu // ""' <<<"$row")
         desktop=$(jq -r 'if .desktop == true then 1 else 0 end' <<<"$row")
         [[ $gpu == nvidia ]] && nvidia_connected=1
+        [[ $gpu == amd ]] && amd_connected=1
         add_output "$conn" "$gpu" "$desktop"
       done < <(jq -c '.[]' <<<"$GPU_STATUS_OUTPUTS")
     fi
     return 0
   fi
 
-  local nv_real="" ig_real="" desktop_names=() name card conn_name real vendor state dir desk
-  [[ -e ${nv_card:-/dev/dri/nvidia-dgpu} ]] && nv_real=$(readlink -f "${nv_card:-/dev/dri/nvidia-dgpu}")
-  [[ -e ${ig_card:-/dev/dri/intel-igpu} ]] && ig_real=$(readlink -f "${ig_card:-/dev/dri/intel-igpu}")
+  local nv_real="" ig_real="" desktop_names=() name card conn_name real vendor state dir desk dri sys boot
+  dri=$(dri_root)
+  sys=$(sys_drm)
+  [[ -e $dri/nvidia-dgpu ]] && nv_real=$(readlink -f "$dri/nvidia-dgpu")
+  [[ -e $dri/intel-igpu ]] && ig_real=$(readlink -f "$dri/intel-igpu")
 
   if [[ -n ${GPU_STATUS_DESKTOP+x} ]]; then
     IFS=',' read -r -a desktop_names <<<"$GPU_STATUS_DESKTOP"
@@ -711,7 +745,7 @@ load_outputs() {
   fi
 
   shopt -s nullglob
-  for state_path in /sys/class/drm/card*-*/status; do
+  for state_path in "$sys"/card*-*/status; do
     state=$(cat "$state_path" 2>/dev/null || true)
     [[ $state == connected ]] || continue
     dir=$(basename "$(dirname "$state_path")")
@@ -719,21 +753,29 @@ load_outputs() {
     conn_name=${dir#*-}
     [[ $conn_name == *riteback* ]] && continue
     gpu=other
-    real=$(readlink -f "/dev/dri/$card" 2>/dev/null || true)
+    real=$(readlink -f "$dri/$card" 2>/dev/null || true)
     if [[ -n $nv_real && $real == "$nv_real" ]]; then
       gpu=nvidia
       nvidia_connected=1
     elif [[ -n $ig_real && $real == "$ig_real" ]]; then
       gpu=intel
     else
-      vendor=$(cat "/sys/class/drm/$card/device/vendor" 2>/dev/null || true)
-      vendor=$(printf '%s' "$vendor" | tr 'A-F' 'a-f')
+      vendor=$(cat "$sys/$card/device/vendor" 2>/dev/null || true)
+      vendor=$(printf '%s' "$vendor" | tr 'A-F' 'a-f' | tr -d '[:space:]')
       case $vendor in
         0x10de)
           gpu=nvidia
           nvidia_connected=1
           ;;
         0x8086) gpu=intel ;;
+        0x1002)
+          gpu=amd
+          # The internal panel of an AMD integrated GPU is the laptop on
+          # its own, not a screen plugged into a discrete GPU. A missing
+          # boot_vga file means discrete.
+          boot=$(tr -d '[:space:]' <"$sys/$card/device/boot_vga" 2>/dev/null || true)
+          [[ $boot == 1 ]] || amd_connected=1
+          ;;
       esac
     fi
     desk=0
@@ -779,11 +821,14 @@ read_active() {
         case $vendor in
           0x10de) active=nvidia ;;
           0x8086) active=intel ;;
+          0x1002) active=amd ;;
           *)
             if [[ $first == *nvidia* ]]; then
               active=nvidia
             elif [[ $first == *intel* ]]; then
               active=intel
+            elif [[ $first == *amd* ]]; then
+              active=amd
             fi
             ;;
         esac
@@ -791,7 +836,7 @@ read_active() {
     fi
   fi
   case $active in
-    intel|nvidia|unknown) ;;
+    intel|nvidia|amd|unknown) ;;
     *) active=unknown ;;
   esac
 }
@@ -821,12 +866,29 @@ read_present() {
     0|1) ;;
     *) intel_present=0 ;;
   esac
+  # Tests that pin Intel or NVIDIA and do not point at a fake sysfs tree
+  # are not asking about this machine. Leave AMD absent instead of reading
+  # the host.
+  if [[ -n ${GPU_STATUS_AMD_PRESENT+x} ]]; then
+    amd_present=$GPU_STATUS_AMD_PRESENT
+  elif [[ -z ${GPU_STATUS_SYS_DRM+x} && ( -n ${GPU_STATUS_NVIDIA_PRESENT+x} || -n ${GPU_STATUS_INTEL_PRESENT+x} ) ]]; then
+    amd_present=0
+  elif find_vendor_card 0x1002 >/dev/null; then
+    amd_present=1
+  else
+    amd_present=0
+  fi
+  case $amd_present in
+    0|1) ;;
+    *) amd_present=0 ;;
+  esac
 }
 
 read_names() {
   local card slot line parsed
   intel_name=""
   nvidia_name=""
+  amd_name=""
   nvidia_util=""
   nvidia_power=""
   nvidia_mem=""
@@ -879,16 +941,24 @@ read_names() {
     fi
   fi
 
-  intel_name=$(clean_name "$intel_name")
-  nvidia_name=$(clean_name "$nvidia_name")
-  # lspci reports "TigerLake-H GT1 [UHD Graphics]". The bracketed product
-  # name is the one a person recognizes.
-  if [[ $intel_name == *'['*']'* ]]; then
-    local inner=${intel_name#*[}
-    inner=${inner%]*}
-    inner=$(clean_name "$inner")
-    [[ -n $inner ]] && intel_name=$inner
+  if [[ -n ${GPU_STATUS_AMD_NAME+x} ]]; then
+    amd_name=$GPU_STATUS_AMD_NAME
+  elif [[ -z ${GPU_STATUS_SYS_DRM+x} && ( -n ${GPU_STATUS_NVIDIA_PRESENT+x} || -n ${GPU_STATUS_INTEL_PRESENT+x} ) ]]; then
+    amd_name=""
+  else
+    card=""
+    card=$(find_vendor_card 0x1002 || true)
+    if [[ -n $card ]] && command -v lspci >/dev/null 2>&1; then
+      slot=$(basename "$(readlink -f "$(sys_drm)/$card/device")" 2>/dev/null || true)
+      if [[ -n $slot ]]; then
+        amd_name=$(lspci -mm -s "$slot" 2>/dev/null | awk -F'"' '{print $6}' || true)
+      fi
+    fi
   fi
+
+  intel_name=$(product_name "$intel_name")
+  amd_name=$(product_name "$amd_name")
+  nvidia_name=$(clean_name "$nvidia_name")
 }
 
 emit_status() {
@@ -903,14 +973,31 @@ emit_status() {
       *) nvidia_connected=0 ;;
     esac
   fi
+  if [[ -n ${GPU_STATUS_AMD_CONNECTED+x} ]]; then
+    case $GPU_STATUS_AMD_CONNECTED in
+      1) amd_connected=1 ;;
+      *) amd_connected=0 ;;
+    esac
+  fi
   read_names
   load_apps
 
   case $preference in
     intel) next=intel ;;
     nvidia) next=nvidia ;;
+    amd) next=amd ;;
     *)
+      # NVIDIA with a screen, then a discrete AMD GPU with a screen, then
+      # Intel, then an AMD integrated GPU, then NVIDIA with nothing attached.
       if [[ $nvidia_connected == 1 ]]; then
+        next=nvidia
+      elif [[ $amd_connected == 1 ]]; then
+        next=amd
+      elif [[ $intel_present == 1 ]]; then
+        next=intel
+      elif [[ $amd_present == 1 ]]; then
+        next=amd
+      elif [[ $nvidia_present == 1 ]]; then
         next=nvidia
       else
         next=intel
@@ -918,10 +1005,12 @@ emit_status() {
       ;;
   esac
 
-  if [[ $active == intel || $active == nvidia ]] && [[ $next != "$active" ]]; then
+  if [[ $active == intel || $active == nvidia || $active == amd ]] && [[ $next != "$active" ]]; then
     if [[ $next == nvidia && $nvidia_present == 1 ]]; then
       needs_logout=1
     elif [[ $next == intel && $intel_present == 1 ]]; then
+      needs_logout=1
+    elif [[ $next == amd && $amd_present == 1 ]]; then
       needs_logout=1
     fi
   fi
@@ -932,20 +1021,23 @@ emit_status() {
     --arg next "$next" \
     --arg intelName "$intel_name" \
     --arg nvidiaName "$nvidia_name" \
+    --arg amdName "$amd_name" \
     --argjson detail "$([[ ${detail:-0} == 1 ]] && echo true || echo false)" \
     --argjson needsLogout "$([[ $needs_logout == 1 ]] && echo true || echo false)" \
     --argjson intelPresent "$([[ $intel_present == 1 ]] && echo true || echo false)" \
     --argjson nvidiaPresent "$([[ $nvidia_present == 1 ]] && echo true || echo false)" \
+    --argjson amdPresent "$([[ $amd_present == 1 ]] && echo true || echo false)" \
     --argjson nvidiaConnected "$([[ $nvidia_connected == 1 ]] && echo true || echo false)" \
+    --argjson amdConnected "$([[ $amd_connected == 1 ]] && echo true || echo false)" \
     --argjson nvidiaUtil "$(json_number "$nvidia_util")" \
     --argjson nvidiaPower "$(json_number "$nvidia_power")" \
     --argjson nvidiaMem "$(json_number "$nvidia_mem")" \
     --argjson outputs "$outputs_json" \
     --argjson apps "$apps_json" \
     '{active:$active, preference:$preference, next:$next, intelName:$intelName,
-      nvidiaName:$nvidiaName, detail:$detail, needsLogout:$needsLogout,
-      intelPresent:$intelPresent, nvidiaPresent:$nvidiaPresent,
-      nvidiaConnected:$nvidiaConnected, nvidiaUtil:$nvidiaUtil,
+      nvidiaName:$nvidiaName, amdName:$amdName, detail:$detail, needsLogout:$needsLogout,
+      intelPresent:$intelPresent, nvidiaPresent:$nvidiaPresent, amdPresent:$amdPresent,
+      nvidiaConnected:$nvidiaConnected, amdConnected:$amdConnected, nvidiaUtil:$nvidiaUtil,
       nvidiaPower:$nvidiaPower, nvidiaMem:$nvidiaMem, outputs:$outputs, apps:$apps}'
 }
 
@@ -977,18 +1069,19 @@ self_test() {
       GPU_STATUS_NVIDIA_PRESENT=1 \
       GPU_STATUS_INTEL_PRESENT=1 \
       GPU_STATUS_INTEL_NAME='<b>UHD</b>' \
+      GPU_STATUS_AMD_NAME='Navi 22 [RX 6700]' \
       GPU_STATUS_NVIDIA_CSV='<img src="https://evil.invalid/t.png">&, 12, 19.5, 100' \
-      GPU_STATUS_OUTPUTS='[{"connector":"DP-3","gpu":"nvidia","desktop":true},{"connector":"<bad>","gpu":"intel"}]' \
-      GPU_STATUS_APPS='[{"name":"<&Chromium>","gpu":"nvidia"},{"name":"foot","gpu":"intel"},{"name":"Game","gpu":"both"},{"name":"nope","gpu":"amd"},{"name":"","gpu":"intel"}]' \
+      GPU_STATUS_OUTPUTS='[{"connector":"DP-3","gpu":"nvidia","desktop":true},{"connector":"<bad>","gpu":"intel"},{"connector":"HDMI-A-1","gpu":"amd"}]' \
+      GPU_STATUS_APPS='[{"name":"<&Chromium>","gpu":"nvidia"},{"name":"foot","gpu":"intel"},{"name":"Game","gpu":"both","vendors":["nvidia","intel"]},{"name":"nope","gpu":"bogus"},{"name":"Radeon","gpu":"amd"},{"name":"","gpu":"intel"}]' \
       GPU_STATUS_BIN_DIR="$tmp/nobin" \
       XDG_DATA_HOME="$tmp/data" \
       bash "$script" status
   )
-  assert_jq "$json" '.active == "intel" and .preference == "auto" and .next == "nvidia" and .needsLogout == true and .detail == true'
-  assert_jq "$json" '.nvidiaUtil == 12 and .nvidiaPower == 19.5 and .nvidiaMem == 100'
-  assert_jq "$json" '.outputs | length == 1 and .[0].connector == "DP-3" and .[0].desktop == true'
-  assert_jq "$json" '.apps | length == 3 and .[0].id == "chromium" and .[0].name == "Chromium" and .[0].gpu == "nvidia" and .[0].preference == "desktop" and .[0].launchable == false and .[1].id == "game" and .[1].name == "Game" and .[1].gpu == "both" and .[2].id == "foot" and .[2].name == "Foot" and .[2].gpu == "intel"'
-  if printf '%s' "$json" | jq -r '.intelName, .nvidiaName, .outputs[].connector, .apps[].name, .apps[].id' | grep -q '[<>&]'; then
+  assert_jq "$json" '.active == "intel" and .preference == "auto" and .next == "nvidia" and .needsLogout == true and .detail == true and .amdConnected == true'
+  assert_jq "$json" '.nvidiaUtil == 12 and .nvidiaPower == 19.5 and .nvidiaMem == 100 and .amdName == "RX 6700"'
+  assert_jq "$json" '.outputs | length == 2 and .[0].connector == "DP-3" and .[0].desktop == true and .[1].connector == "HDMI-A-1" and .[1].gpu == "amd"'
+  assert_jq "$json" '.apps | length == 4 and .[0].id == "chromium" and .[0].name == "Chromium" and .[0].gpu == "nvidia" and .[0].preference == "desktop" and .[0].launchable == false and .[1].id == "game" and .[1].name == "Game" and .[1].gpu == "both" and .[1].vendors == ["intel","nvidia"] and .[2].id == "radeon" and .[2].gpu == "amd" and .[3].id == "foot" and .[3].name == "Foot" and .[3].gpu == "intel"'
+  if printf '%s' "$json" | jq -r '.intelName, .nvidiaName, .amdName, .outputs[].connector, .apps[].name, .apps[].id' | grep -q '[<>&]'; then
     fail "markup survived in a name shown by the panel"
   fi
 
@@ -1033,7 +1126,7 @@ self_test() {
   set -e
   [[ $code -ne 0 ]] || fail "rejected mode was accepted"
   [[ ! -e /tmp/gpu-widget-pwned ]] || fail "mode was executed as a command"
-  if [[ -f $tmp/config/uwsm/gpu-mode ]] && [[ $(cat "$tmp/config/uwsm/gpu-mode") != intel && $(cat "$tmp/config/uwsm/gpu-mode") != auto && $(cat "$tmp/config/uwsm/gpu-mode") != nvidia ]]; then
+  if [[ -f $tmp/config/uwsm/gpu-mode ]] && [[ $(cat "$tmp/config/uwsm/gpu-mode") != intel && $(cat "$tmp/config/uwsm/gpu-mode") != auto && $(cat "$tmp/config/uwsm/gpu-mode") != nvidia && $(cat "$tmp/config/uwsm/gpu-mode") != amd ]]; then
     fail "mode file contains an unexpected value"
   fi
 
@@ -1096,7 +1189,7 @@ self_test() {
       GPU_STATUS_OUTPUTS='[]' \
       bash "$script" brief
   )
-  assert_jq "$json" '.active == "unknown"'
+  assert_jq "$json" '.active == "amd" and .amdPresent == true'
   touch "$tmp/dri/nvidia-dgpu"
   json=$(
     XDG_CONFIG_HOME="$tmp/config" \
@@ -1127,6 +1220,60 @@ self_test() {
 
   local mode_before launch app_json wrapper desk
   mode_before=$(cat "$tmp/config/uwsm/gpu-mode")
+
+  rm -f "$tmp/config/uwsm/gpu-mode"
+  json=$(
+    XDG_CONFIG_HOME="$tmp/config" \
+      GPU_STATUS_ACTIVE=intel \
+      GPU_STATUS_NV_CONNECTED=0 \
+      GPU_STATUS_AMD_CONNECTED=1 \
+      GPU_STATUS_NVIDIA_PRESENT=1 \
+      GPU_STATUS_INTEL_PRESENT=1 \
+      GPU_STATUS_AMD_PRESENT=1 \
+      GPU_STATUS_OUTPUTS='[]' \
+      bash "$script" brief
+  )
+  assert_jq "$json" '.preference == "auto" and .next == "amd" and .needsLogout == true and .amdPresent == true'
+
+  mkdir -p "$tmp/amd-sys/card0/device" "$tmp/amd-sys/card0-eDP-1" \
+    "$tmp/amd-sys/card1/device" "$tmp/amd-sys/card1-HDMI-A-1" "$tmp/amd-dri"
+  printf '0x8086\n' >"$tmp/amd-sys/card0/device/vendor"
+  printf '1\n' >"$tmp/amd-sys/card0/device/boot_vga"
+  printf 'connected\n' >"$tmp/amd-sys/card0-eDP-1/status"
+  printf '0x1002\n' >"$tmp/amd-sys/card1/device/vendor"
+  printf '1\n' >"$tmp/amd-sys/card1/device/boot_vga"
+  printf 'connected\n' >"$tmp/amd-sys/card1-HDMI-A-1/status"
+  json=$(
+    XDG_CONFIG_HOME="$tmp/config" \
+      GPU_STATUS_DRI_ROOT="$tmp/amd-dri" \
+      GPU_STATUS_SYS_DRM="$tmp/amd-sys" \
+      GPU_STATUS_ACTIVE=intel \
+      GPU_STATUS_DESKTOP= \
+      bash "$script" brief
+  )
+  assert_jq "$json" '.next == "intel" and .amdConnected == false and .amdPresent == true and .intelPresent == true and .needsLogout == false'
+  printf '0\n' >"$tmp/amd-sys/card1/device/boot_vga"
+  json=$(
+    XDG_CONFIG_HOME="$tmp/config" \
+      GPU_STATUS_DRI_ROOT="$tmp/amd-dri" \
+      GPU_STATUS_SYS_DRM="$tmp/amd-sys" \
+      GPU_STATUS_ACTIVE=intel \
+      GPU_STATUS_DESKTOP= \
+      bash "$script" brief
+  )
+  assert_jq "$json" '.next == "amd" and .amdConnected == true and .needsLogout == true'
+
+  XDG_CONFIG_HOME="$tmp/config" \
+    GPU_STATUS_ACTIVE=intel \
+    GPU_STATUS_NV_CONNECTED=0 \
+    GPU_STATUS_NVIDIA_PRESENT=1 \
+    GPU_STATUS_INTEL_PRESENT=1 \
+    GPU_STATUS_AMD_PRESENT=1 \
+    GPU_STATUS_OUTPUTS='[]' \
+    bash "$script" set amd >/dev/null
+  [[ $(cat "$tmp/config/uwsm/gpu-mode") == amd ]] || fail "set amd did not stick"
+  printf '%s\n' "$mode_before" >"$tmp/config/uwsm/gpu-mode"
+
   mkdir -p "$tmp/bins" "$tmp/desktops" "$tmp/pci/0000:00:02.0" "$tmp/pci/0000:01:00.0" \
     "$tmp/sys/renderD128" "$tmp/sys/renderD129" "$tmp/data/applications"
   printf '0x8086\n' >"$tmp/pci/0000:00:02.0/vendor"
@@ -1200,6 +1347,7 @@ EOF
   [[ $app_json == *"binary=$tmp/bins/chromium"* ]] || fail "launch print used the wrong program"
   [[ $app_json == *"gl=mesa"* ]] || fail "launch print lost the mesa driver"
   [[ $app_json == *"flag=--render-node-override=$tmp/missing-dri/by-path/pci-0000:00:02.0-render"* ]] || fail "launch print lost the render node"
+  [[ $app_json == *"prime=-"* ]] || fail "intel launch printed a DRI prime id"
   [[ ! -e $tmp/executed ]] || fail "--print started the program"
   set +e
   XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
@@ -1210,6 +1358,33 @@ EOF
   set -e
   [[ $code -ne 0 ]] || fail "missing render node still launched chromium"
   [[ ! -e $tmp/executed ]] || fail "missing render node started chromium"
+
+  mkdir -p "$tmp/pci/0000:03:00.0" "$tmp/sys/renderD130"
+  printf '0x1002\n' >"$tmp/pci/0000:03:00.0/vendor"
+  ln -s "$tmp/pci/0000:03:00.0" "$tmp/sys/renderD130/device"
+  XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+    GPU_STATUS_BIN_DIR="$tmp/bins" GPU_STATUS_DESKTOP_DIR="$tmp/desktops" \
+    GPU_STATUS_ACTIVE=nvidia GPU_STATUS_NV_CONNECTED=1 \
+    GPU_STATUS_NVIDIA_PRESENT=1 GPU_STATUS_INTEL_PRESENT=1 GPU_STATUS_AMD_PRESENT=1 \
+    GPU_STATUS_OUTPUTS='[]' \
+    bash "$script" set-app chromium amd >/dev/null
+  app_json=$(
+    XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+      GPU_STATUS_BIN_DIR="$tmp/bins" GPU_STATUS_DESKTOP_DIR="$tmp/desktops" \
+      GPU_STATUS_SYS_DRM="$tmp/sys" GPU_STATUS_DRI_ROOT="$tmp/missing-dri" \
+      bash "$launch" --print chromium
+  )
+  [[ $app_json == *"mode=amd"* ]] || fail "launch print lost the amd mode"
+  [[ $app_json == *"gl=mesa"* ]] || fail "amd launch left the mesa driver"
+  [[ $app_json == *"flag=--render-node-override=$tmp/missing-dri/by-path/pci-0000:03:00.0-render"* ]] || fail "amd launch lost the render node"
+  [[ $app_json == *"prime=pci-0000_03_00_0"* ]] || fail "amd launch lost the DRI prime id"
+  [[ ! -e $tmp/executed ]] || fail "amd --print started the program"
+  XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+    GPU_STATUS_BIN_DIR="$tmp/bins" GPU_STATUS_DESKTOP_DIR="$tmp/desktops" \
+    GPU_STATUS_ACTIVE=nvidia GPU_STATUS_NV_CONNECTED=1 \
+    GPU_STATUS_NVIDIA_PRESENT=1 GPU_STATUS_INTEL_PRESENT=1 \
+    GPU_STATUS_OUTPUTS='[]' \
+    bash "$script" set-app chromium intel >/dev/null
 
   json=$(
     XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
@@ -1242,7 +1417,26 @@ EOF
       GPU_STATUS_BIN_DIR="$tmp/bins" GPU_STATUS_SYS_DRM="$tmp/sys" \
       bash "$launch" --print voxtype
   )
-  [[ $app_json == *"mode=nvidia"* && $app_json == *"gl=nvidia"* && $app_json == *"flag=-"* ]] || fail "non-browser pin passed a render node"
+  [[ $app_json == *"mode=nvidia"* && $app_json == *"gl=nvidia"* && $app_json == *"flag=-"* && $app_json == *"prime=-"* ]] || fail "non-browser pin passed a render node"
+  XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+    GPU_STATUS_BIN_DIR="$tmp/bins" GPU_STATUS_DESKTOP_DIR="$tmp/desktops" \
+    GPU_STATUS_ACTIVE=nvidia GPU_STATUS_NV_CONNECTED=1 \
+    GPU_STATUS_NVIDIA_PRESENT=1 GPU_STATUS_INTEL_PRESENT=1 GPU_STATUS_AMD_PRESENT=1 \
+    GPU_STATUS_OUTPUTS='[]' \
+    bash "$script" set-app voxtype amd >/dev/null
+  app_json=$(
+    XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+      GPU_STATUS_BIN_DIR="$tmp/bins" GPU_STATUS_SYS_DRM="$tmp/sys" \
+      GPU_STATUS_DRI_ROOT="$tmp/missing-dri" \
+      bash "$launch" --print voxtype
+  )
+  [[ $app_json == *"mode=amd"* && $app_json == *"gl=mesa"* && $app_json == *"flag=-"* && $app_json == *"prime=pci-0000_03_00_0"* ]] || fail "non-browser amd pin lost DRI_PRIME"
+  XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+    GPU_STATUS_BIN_DIR="$tmp/bins" GPU_STATUS_DESKTOP_DIR="$tmp/desktops" \
+    GPU_STATUS_ACTIVE=nvidia GPU_STATUS_NV_CONNECTED=1 \
+    GPU_STATUS_NVIDIA_PRESENT=1 GPU_STATUS_INTEL_PRESENT=1 \
+    GPU_STATUS_OUTPUTS='[]' \
+    bash "$script" set-app voxtype nvidia >/dev/null
 
   printf '%s\n' 'Exec=chromium %U' 'Name=Mine' >"$tmp/data/applications/chromium.desktop"
   XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
@@ -1310,7 +1504,8 @@ if (/[<>&]/.test(dirty)) process.exit(1)
 if (sandbox.plain("RTX 3080") !== "RTX 3080") process.exit(1)
 if (sandbox.plain(null) !== "") process.exit(1)
 if (sandbox.plain("x".repeat(200)).length !== 96) process.exit(1)
-if (!sandbox.allowedAppPref("desktop") || !sandbox.allowedAppPref("intel") || sandbox.allowedAppPref("auto")) process.exit(1)
+if (!sandbox.allowedAppPref("desktop") || !sandbox.allowedAppPref("intel") || !sandbox.allowedAppPref("amd") || sandbox.allowedAppPref("auto")) process.exit(1)
+if (!sandbox.allowedMode("amd") || sandbox.allowedMode("radeon")) process.exit(1)
 if (!sandbox.allowedAppId("chromium") || sandbox.allowedAppId("chromium;touch") || sandbox.allowedAppId("../etc")) process.exit(1)
 ' "$(dirname "$script")/Model.js" || fail "Model.plain kept markup"
   else
@@ -1344,7 +1539,7 @@ case $command in
     emit_status
     ;;
   *)
-    echo "usage: gpu-status [brief|status|set auto|intel|nvidia|set-app ID desktop|intel|nvidia|--self-test]" >&2
+    echo "usage: gpu-status [brief|status|set auto|intel|nvidia|amd|set-app ID desktop|intel|nvidia|amd|--self-test]" >&2
     exit 2
     ;;
 esac

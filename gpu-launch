@@ -44,7 +44,7 @@ lookup_pin() {
   file=$(apps_file)
   [[ -f $file ]] || return 0
   while IFS= read -r line || [[ -n $line ]]; do
-    [[ $line =~ ^([a-z0-9][a-z0-9._+-]{0,40})[[:space:]]+(intel|nvidia)[[:space:]]+(/[^[:space:]]+)[[:space:]]+([^[:space:]]+)$ ]] || continue
+    [[ $line =~ ^([a-z0-9][a-z0-9._+-]{0,40})[[:space:]]+(intel|nvidia|amd)[[:space:]]+(/[^[:space:]]+)[[:space:]]+([^[:space:]]+)$ ]] || continue
     [[ ${BASH_REMATCH[1]} == "$want" ]] || continue
     pin_mode=${BASH_REMATCH[2]}
     pin_binary=${BASH_REMATCH[3]}
@@ -78,6 +78,7 @@ render_node_for() {
   case $want in
     intel) vendor_want=0x8086 ;;
     nvidia) vendor_want=0x10de ;;
+    amd) vendor_want=0x1002 ;;
     *) return 1 ;;
   esac
   sys=$(sys_drm)
@@ -159,8 +160,13 @@ mode=$pin_mode
 node=""
 flag=""
 gl="-"
-if [[ $mode == intel || $mode == nvidia ]]; then
-  gl=$([[ $mode == intel ]] && echo mesa || echo nvidia)
+prime="-"
+if [[ $mode == intel || $mode == nvidia || $mode == amd ]]; then
+  if [[ $mode == nvidia ]]; then
+    gl=nvidia
+  else
+    gl=mesa
+  fi
   if wants_render_node "$id"; then
     node=$(render_node_for "$mode" || true)
     if [[ -z $node ]]; then
@@ -172,6 +178,11 @@ if [[ $mode == intel || $mode == nvidia ]]; then
     elif ! user_has_override "$@"; then
       flag="--render-node-override=$node"
     fi
+  elif [[ $mode == amd ]]; then
+    node=$(render_node_for amd || true)
+  fi
+  if [[ $mode == amd && $node =~ pci-([0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7])-render ]]; then
+    prime=pci-${BASH_REMATCH[1]//[:.]/_}
   fi
 fi
 
@@ -181,6 +192,7 @@ if [[ $print_only == 1 ]]; then
   printf 'node=%s\n' "${node:--}"
   printf 'gl=%s\n' "$gl"
   printf 'flag=%s\n' "${flag:--}"
+  printf 'prime=%s\n' "$prime"
   exit 0
 fi
 
@@ -188,11 +200,16 @@ if [[ $mode == desktop ]]; then
   exec "$binary" "$@"
 fi
 
-if [[ $mode == intel ]]; then
+if [[ $mode == intel || $mode == amd ]]; then
   unset __NV_PRIME_RENDER_OFFLOAD __VK_LAYER_NV_optimus
   export __GLX_VENDOR_LIBRARY_NAME=mesa
   export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
-  export VK_LOADER_DRIVERS_SELECT=intel_icd.json
+  if [[ $mode == amd ]]; then
+    export VK_LOADER_DRIVERS_SELECT=radeon_icd.json
+    [[ $prime == - ]] || export DRI_PRIME=$prime
+  else
+    export VK_LOADER_DRIVERS_SELECT=intel_icd.json
+  fi
 else
   unset __EGL_VENDOR_LIBRARY_FILENAMES
   export __NV_PRIME_RENDER_OFFLOAD=1

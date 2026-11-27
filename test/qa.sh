@@ -22,7 +22,7 @@ bash -n gpu-launch
 link=$(find . -name .git -prune -o -type l -print -quit)
 [[ -z $link ]] || fail "symlink inside the plugin: $link"
 
-jq -e '.schemaVersion == 1 and .id == "aponhcet.gpu" and .version == "1.4.0"' manifest.json >/dev/null \
+jq -e '.schemaVersion == 1 and .id == "aponhcet.gpu" and .version == "1.5.0"' manifest.json >/dev/null \
   || fail "manifest id, schema, or version"
 version=$(jq -r .version manifest.json)
 [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "version must be major.minor.patch"

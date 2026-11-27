@@ -11,15 +11,15 @@ function plain(value) {
 }
 
 function allowedMode(mode) {
-  return mode === "auto" || mode === "intel" || mode === "nvidia"
+  return mode === "auto" || mode === "intel" || mode === "nvidia" || mode === "amd"
 }
 
 function allowedGpu(gpu) {
-  return gpu === "intel" || gpu === "nvidia" || gpu === "other" || gpu === "unknown"
+  return gpu === "intel" || gpu === "nvidia" || gpu === "amd" || gpu === "other" || gpu === "unknown"
 }
 
 function allowedAppPref(mode) {
-  return mode === "desktop" || mode === "intel" || mode === "nvidia"
+  return mode === "desktop" || mode === "intel" || mode === "nvidia" || mode === "amd"
 }
 
 function allowedAppId(id) {

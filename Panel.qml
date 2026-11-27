@@ -22,9 +22,11 @@ Panel {
   property string next: "unknown"
   property string intelName: ""
   property string nvidiaName: ""
+  property string amdName: ""
   property bool needsLogout: false
   property bool intelPresent: true
   property bool nvidiaPresent: true
+  property bool amdPresent: false
   property bool nvidiaConnected: false
   property var nvidiaUtil: null
   property var nvidiaPower: null
@@ -45,7 +47,12 @@ Panel {
   property bool refreshQueued: false
   property bool refreshAfterSet: false
 
-  readonly property var modes: ["auto", "intel", "nvidia"]
+  readonly property var modes: ["auto", "intel", "nvidia", "amd"]
+  readonly property int shownModeCount: {
+    var n = 0
+    for (var i = 0; i < modes.length; i++) if (modeShown(modes[i])) n++
+    return Math.max(n, 1)
+  }
   readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
   readonly property color urgent: bar ? bar.urgent : Commons.Color.urgent
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
@@ -56,6 +63,7 @@ Panel {
     var _lang = strings.language
     var full = active === "nvidia" ? strings.t("gpu.markNvidia")
       : active === "intel" ? strings.t("gpu.markIntel")
+      : active === "amd" ? strings.t("gpu.markAmd")
       : strings.t("gpu.markUnknown")
     return barVertical && full.length > 0 ? full.charAt(0) : full
   }
@@ -80,6 +88,7 @@ Panel {
   function gpuWord(id) {
     if (id === "nvidia") return strings.t("gpu.nvidia")
     if (id === "intel") return strings.t("gpu.intel")
+    if (id === "amd") return strings.t("gpu.amd")
     if (id === "other") return strings.t("gpu.other")
     return strings.t("gpu.unknown")
   }
@@ -87,13 +96,33 @@ Panel {
   function modeAvailable(mode) {
     if (mode === "intel") return intelPresent
     if (mode === "nvidia") return nvidiaPresent
-    return true
+    if (mode === "amd") return amdPresent
+    return mode === "auto"
+  }
+
+  function modeShown(mode) {
+    if (mode === "auto") return true
+    if (modeAvailable(mode)) return true
+    return preference === mode
   }
 
   function shownName(id) {
-    var custom = id === "nvidia" ? nvidiaName : id === "intel" ? intelName : ""
+    var custom = id === "nvidia" ? nvidiaName : id === "intel" ? intelName : id === "amd" ? amdName : ""
     if (custom !== "") return custom
     return gpuWord(id)
+  }
+
+  function vendorWords(app) {
+    var names = []
+    var raw = app && app.vendors
+    if (!Array.isArray(raw)) return names
+    for (var i = 0; i < raw.length && names.length < 3; i++) {
+      var token = raw[i]
+      if (token !== "intel" && token !== "nvidia" && token !== "amd") continue
+      var word = gpuWord(token)
+      if (names.indexOf(word) < 0) names.push(word)
+    }
+    return names
   }
 
   function asNumber(value) {
@@ -108,22 +137,24 @@ Panel {
       error = strings.t("gpu.readFailed")
       return
     }
-    if (!data || (data.active !== "intel" && data.active !== "nvidia" && data.active !== "unknown")) {
+    if (!data || (data.active !== "intel" && data.active !== "nvidia" && data.active !== "amd" && data.active !== "unknown")) {
       error = strings.t("gpu.readFailed")
       return
     }
     active = data.active
-    if (data.preference === "auto" || data.preference === "intel" || data.preference === "nvidia")
+    if (data.preference === "auto" || data.preference === "intel" || data.preference === "nvidia" || data.preference === "amd")
       preference = data.preference
-    if (data.next === "intel" || data.next === "nvidia")
+    if (data.next === "intel" || data.next === "nvidia" || data.next === "amd")
       next = data.next
     if (typeof data.needsLogout === "boolean") needsLogout = data.needsLogout
     if (typeof data.intelPresent === "boolean") intelPresent = data.intelPresent
     if (typeof data.nvidiaPresent === "boolean") nvidiaPresent = data.nvidiaPresent
+    if (typeof data.amdPresent === "boolean") amdPresent = data.amdPresent
     if (typeof data.nvidiaConnected === "boolean") nvidiaConnected = data.nvidiaConnected
     if (data.detail === true) {
       intelName = Model.plain(data.intelName)
       nvidiaName = Model.plain(data.nvidiaName)
+      amdName = Model.plain(data.amdName)
       nvidiaUtil = asNumber(data.nvidiaUtil)
       nvidiaPower = asNumber(data.nvidiaPower)
       nvidiaMem = asNumber(data.nvidiaMem)
@@ -135,15 +166,23 @@ Panel {
           if (!app) continue
           var appName = Model.plain(app.name)
           if (appName === "") continue
-          var appGpu = app.gpu === "intel" || app.gpu === "nvidia" || app.gpu === "both" || app.gpu === "none" ? app.gpu : ""
+          var appGpu = app.gpu === "intel" || app.gpu === "nvidia" || app.gpu === "amd" || app.gpu === "both" || app.gpu === "none" ? app.gpu : ""
           if (appGpu === "") continue
           var appId = Model.allowedAppId(app.id) ? app.id : ""
           if (appId === "" && appGpu === "none") continue
-          var appPref = app.preference === "intel" || app.preference === "nvidia" ? app.preference : "desktop"
+          var appPref = app.preference === "intel" || app.preference === "nvidia" || app.preference === "amd" ? app.preference : "desktop"
+          var appVendors = []
+          if (Array.isArray(app.vendors)) {
+            for (var v = 0; v < app.vendors.length && appVendors.length < 3; v++) {
+              var token = app.vendors[v]
+              if (token === "intel" || token === "nvidia" || token === "amd") appVendors.push(token)
+            }
+          }
           found.push({
             id: appId,
             name: appName,
             gpu: appGpu,
+            vendors: appVendors,
             preference: appPref,
             launchable: app.launchable === true && appId !== "",
             attached: app.attached === true
@@ -161,7 +200,7 @@ Panel {
         if (!row) continue
         var connector = Model.plain(row.connector)
         if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(connector)) continue
-        var gpu = row.gpu === "intel" || row.gpu === "nvidia" || row.gpu === "other" ? row.gpu : ""
+        var gpu = row.gpu === "intel" || row.gpu === "nvidia" || row.gpu === "amd" || row.gpu === "other" ? row.gpu : ""
         if (gpu === "") continue
         list.push({ connector: connector, gpu: gpu, desktop: row.desktop === true })
       }
@@ -201,6 +240,7 @@ Panel {
     if (!Model.allowedAppId(id) || !Model.allowedAppPref(mode)) return
     if (mode === "intel" && !intelPresent) return
     if (mode === "nvidia" && !nvidiaPresent) return
+    if (mode === "amd" && !amdPresent) return
     if (scriptPath === "" || setProc.running) return
     requestId += 1
     setProc.command = ["bash", scriptPath, "set-app", id, mode]
@@ -234,10 +274,15 @@ Panel {
     if (dy > 0 && focusSection === "modes" && needsLogout) focusSection = "logout"
     else if (dy < 0 && focusSection === "logout") focusSection = "modes"
     else if (dx !== 0 && focusSection === "modes") {
-      var index = modeIndex + dx
-      if (index < 0) index = 0
-      if (index > modes.length - 1) index = modes.length - 1
-      modeIndex = index
+      var index = modeIndex
+      for (var guard = 0; guard < modes.length; guard++) {
+        index += dx
+        if (index < 0 || index > modes.length - 1) return
+        if (modeShown(modes[index])) {
+          modeIndex = index
+          return
+        }
+      }
     }
   }
 
@@ -386,6 +431,7 @@ Panel {
         if (t === "a" || t === "A") root.setMode("auto")
         else if (t === "i" || t === "I") root.setMode("intel")
         else if (t === "n" || t === "N") root.setMode("nvidia")
+        else if (t === "m" || t === "M") root.setMode("amd")
         else if (t === "r" || t === "R") root.refresh()
       }
 
@@ -633,7 +679,7 @@ Panel {
               width: column.width
               spacing: 0
               readonly property string appId: modelData && modelData.id ? modelData.id : ""
-              readonly property string appPref: modelData && (modelData.preference === "intel" || modelData.preference === "nvidia") ? modelData.preference : "desktop"
+              readonly property string appPref: modelData && (modelData.preference === "intel" || modelData.preference === "nvidia" || modelData.preference === "amd") ? modelData.preference : "desktop"
               readonly property bool appLaunchable: !!(modelData && modelData.launchable && appId !== "")
               readonly property bool appAttached: !!(modelData && modelData.attached)
               readonly property bool showChoices: root.appsAdvanced && (appLaunchable || (appPref !== "desktop" && !appAttached))
@@ -644,6 +690,8 @@ Panel {
                 text: {
                   var _lang = strings.language
                   if (appRow.modelData.gpu === "both") {
+                    var mix = root.vendorWords(appRow.modelData)
+                    if (mix.length >= 2) return strings.t("gpu.appMix").arg(appRow.modelData.name).arg(mix.join(" + "))
                     return strings.t("gpu.appBoth")
                       .arg(appRow.modelData.name)
                       .arg(strings.t("gpu.nvidia"))
@@ -698,25 +746,40 @@ Panel {
                     visible: appRow.appLaunchable
                     width: parent.width
                     spacing: Style.space(6)
-                    readonly property real cellWidth: (width - spacing * 2) / 3
+                    function choiceShown(mode) {
+                      if (mode === "desktop") return true
+                      if (mode === "intel") return root.intelPresent || appRow.appPref === "intel"
+                      if (mode === "nvidia") return root.nvidiaPresent || appRow.appPref === "nvidia"
+                      if (mode === "amd") return root.amdPresent || appRow.appPref === "amd"
+                      return false
+                    }
+                    readonly property int shownCount: {
+                      var choices = ["desktop", "intel", "nvidia", "amd"]
+                      var n = 0
+                      for (var i = 0; i < choices.length; i++) if (choiceShown(choices[i])) n++
+                      return Math.max(n, 1)
+                    }
+                    readonly property real cellWidth: (width - spacing * (shownCount - 1)) / shownCount
 
                     Repeater {
-                      model: ["desktop", "intel", "nvidia"]
+                      model: ["desktop", "intel", "nvidia", "amd"]
                       Button {
                         id: gpuChoice
                         required property var modelData
+                        visible: appModeRow.choiceShown(modelData)
                         width: appModeRow.cellWidth
                         text: {
                           var _lang = strings.language
                           if (modelData === "intel") return strings.t("gpu.intel")
                           if (modelData === "nvidia") return strings.t("gpu.nvidia")
+                          if (modelData === "amd") return strings.t("gpu.amd")
                           return strings.t("gpu.appDesktop")
                         }
                         fontSize: Style.font.bodySmall
                         foreground: root.foreground
                         fontFamily: root.fontFamily
                         bordered: true
-                        enabled: root.appsAdvanced && (modelData === "desktop" || (modelData === "intel" && root.intelPresent) || (modelData === "nvidia" && root.nvidiaPresent))
+                        enabled: root.appsAdvanced && appModeRow.choiceShown(modelData)
                         opacity: enabled ? 1 : 0.35
                         active: appRow.appPref === modelData
                         hasCursor: false
@@ -863,25 +926,27 @@ Panel {
             id: modeRow
             width: parent.width
             spacing: Style.space(6)
-            readonly property real cellWidth: (width - spacing * 2) / 3
+            readonly property real cellWidth: (width - spacing * (root.shownModeCount - 1)) / root.shownModeCount
 
             Repeater {
               model: root.modes
               Button {
                 required property var modelData
                 required property int index
+                visible: root.modeShown(modelData)
                 width: modeRow.cellWidth
                 text: {
                   var _lang = strings.language
                   if (modelData === "intel") return strings.t("gpu.intel")
                   if (modelData === "nvidia") return strings.t("gpu.nvidia")
+                  if (modelData === "amd") return strings.t("gpu.amd")
                   return strings.t("gpu.auto")
                 }
                 fontSize: Style.font.bodySmall
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 bordered: true
-                enabled: root.modeAvailable(modelData)
+                enabled: root.modeShown(modelData)
                 opacity: enabled ? 1 : 0.35
                 active: root.preference === modelData
                 hasCursor: root.cursorActive && root.focusSection === "modes" && root.modeIndex === index
@@ -904,6 +969,7 @@ Panel {
               var _lang = strings.language
               if (root.preference === "intel") return strings.t("gpu.intelHint")
               if (root.preference === "nvidia") return strings.t("gpu.nvidiaHint")
+              if (root.preference === "amd") return strings.t("gpu.amdHint")
               return strings.t("gpu.autoHint")
             }
             color: Qt.darker(root.foreground, 1.4)
