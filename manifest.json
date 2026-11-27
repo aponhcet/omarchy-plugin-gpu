@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "aponhcet.gpu",
   "name": "GPU",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "author": "aponhcet",
   "license": "MIT",
   "description": "Shows which GPU the desktop and each app are rendering on, and chooses Intel or NVIDIA for the next login or the next time an app starts.",

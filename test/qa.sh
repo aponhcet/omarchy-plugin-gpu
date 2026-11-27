@@ -22,7 +22,7 @@ bash -n gpu-launch
 link=$(find . -name .git -prune -o -type l -print -quit)
 [[ -z $link ]] || fail "symlink inside the plugin: $link"
 
-jq -e '.schemaVersion == 1 and .id == "aponhcet.gpu" and .version == "1.3.0"' manifest.json >/dev/null \
+jq -e '.schemaVersion == 1 and .id == "aponhcet.gpu" and .version == "1.4.0"' manifest.json >/dev/null \
   || fail "manifest id, schema, or version"
 jq -e '(.kinds | index("bar-widget")) != null and .entryPoints.barWidget == "Panel.qml"' manifest.json >/dev/null \
   || fail "manifest must load Panel.qml as a bar widget"
@@ -33,7 +33,7 @@ grep -q '^## Remove' README.md || fail "README needs a Remove section"
 python3 - "$root" <<'PY'
 import json, pathlib, re, sys
 root = pathlib.Path(sys.argv[1])
-panel = (root / "Panel.qml").read_text()
+panel = (root / "Panel.qml").read_text() + "\n" + (root / "DotWave.qml").read_text()
 catalog = json.loads((root / "i18n" / "en.json").read_text())
 if not isinstance(catalog, dict) or not catalog:
     raise SystemExit("qa: en.json must be a flat catalog")
@@ -49,13 +49,22 @@ missing = sorted(used - catalog.keys())
 if missing:
     raise SystemExit("qa: Panel.qml uses unknown strings: " + ", ".join(missing))
 
-for line in panel.splitlines():
+lines = panel.splitlines()
+for index, line in enumerate(lines):
     if "duration:" in line and "Style.duration(" not in line:
         raise SystemExit("qa: animation duration must use Style.duration: " + line.strip())
     if re.search(r"Easing\.In", line):
         raise SystemExit("qa: ease-in is not used: " + line.strip())
     match = re.search(r"Style\.duration\((\d+)", line)
-    if match and int(match.group(1)) > 300:
+    if not match:
+        continue
+    ms = int(match.group(1))
+    window = "\n".join(lines[max(0, index - 4):index + 8])
+    # Entrances stay under 300ms. The loading wave is a linear spinner.
+    if "Easing.Linear" in window:
+        if ms > 1200:
+            raise SystemExit("qa: spinner longer than 1200ms: " + line.strip())
+    elif ms > 300:
         raise SystemExit("qa: animation longer than 300ms: " + line.strip())
 
 if "property bool appsAdvanced: false" not in panel:

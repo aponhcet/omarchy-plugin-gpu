@@ -25,7 +25,7 @@
   "gpu.appLaunch": "A choice applies the next time that app starts.",
   "gpu.appDesktop": "Desktop",
   "gpu.appDesktopTip": "Follows the desktop GPU. It applies the next time this app starts.",
-  "gpu.advanced": "Advanced",
+  "gpu.advanced": "Show the GPU choice for each app",
   "gpu.appNoLauncher": "Saved. This program has no menu entry to attach it to.",
   "gpu.appsNote": "An app can still choose the other GPU.",
   "gpu.logout": "Log out to apply",

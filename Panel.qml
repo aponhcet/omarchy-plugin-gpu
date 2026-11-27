@@ -32,6 +32,9 @@ Panel {
   property var outputs: []
   property var apps: []
   property bool appsAdvanced: false
+  property bool detailSeen: false
+  readonly property bool gpuRefreshing: opened && statusProc.running
+  readonly property bool appsLoading: opened && !detailSeen && error === ""
   property string error: ""
   property bool logoutArmed: false
   property string focusSection: "modes"
@@ -148,6 +151,7 @@ Panel {
         }
       }
       apps = found
+      detailSeen = true
     }
     var list = []
     if (Array.isArray(data.outputs)) {
@@ -254,7 +258,13 @@ Panel {
   onOpenedChanged: {
     logoutArmed = false
     cursorActive = false
-    if (!opened) appsAdvanced = false
+    if (!opened) {
+      appsAdvanced = false
+      detailSeen = false
+    } else {
+      detailSeen = false
+      apps = []
+    }
     modeIndex = Math.max(0, modes.indexOf(preference))
     refresh()
     poll.restart()
@@ -428,17 +438,34 @@ Panel {
               elide: Text.ElideRight
             }
 
-            Text {
+            Item {
               width: parent.width
-              textFormat: Text.PlainText
-              text: {
-                var _lang = strings.language
-                return root.shownName(root.active)
+              height: gpuName.implicitHeight
+
+              Text {
+                id: gpuName
+                width: parent.width - (gpuWave.visible ? gpuWave.implicitWidth + Style.space(8) : 0)
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                text: {
+                  var _lang = strings.language
+                  return root.shownName(root.active)
+                }
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                elide: Text.ElideRight
               }
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-              elide: Text.ElideRight
+
+              DotWave {
+                id: gpuWave
+                visible: root.gpuRefreshing
+                running: root.gpuRefreshing
+                color: root.foreground
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+              }
             }
           }
         }
@@ -508,27 +535,88 @@ Panel {
           width: parent.width
           spacing: Style.space(8)
 
-          PanelSectionHeader {
-            text: strings.t("gpu.apps")
-            foreground: root.foreground
-            fontFamily: root.fontFamily
+          Item {
+            width: parent.width
+            height: Math.max(appsHeader.implicitHeight, advancedChevron.height)
+
+            PanelSectionHeader {
+              id: appsHeader
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              text: strings.t("gpu.apps")
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            DotWave {
+              visible: root.opened && root.statusProc.running && root.detailSeen
+              running: visible
+              anchors.left: appsHeader.right
+              anchors.leftMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              color: root.foreground
+            }
+
+            Rectangle {
+              id: advancedChevron
+              visible: root.apps.length > 0 && !root.appsLoading
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(22)
+              height: Style.space(22)
+              radius: Math.min(width / 2, Style.cornerRadius)
+              color: advancedHover.containsMouse
+                ? Style.hoverFillFor(root.foreground, Commons.Color.accent)
+                : "transparent"
+
+              Text {
+                anchors.centerIn: parent
+                textFormat: Text.PlainText
+                text: "󰅀"
+                color: root.appsAdvanced ? root.foreground : Qt.darker(root.foreground, 1.35)
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                rotation: root.appsAdvanced ? 180 : 0
+                transformOrigin: Item.Center
+                Behavior on rotation {
+                  RotationAnimation {
+                    duration: Style.duration(180)
+                    direction: RotationAnimation.Shortest
+                    easing.type: Easing.Bezier
+                    easing.bezierCurve: Style.easeOut
+                  }
+                }
+              }
+
+              MouseArea {
+                id: advancedHover
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                Accessible.name: strings.t("gpu.advanced")
+                Accessible.role: Accessible.Button
+                onClicked: root.appsAdvanced = !root.appsAdvanced
+              }
+
+              PanelToolTip {
+                visible: advancedHover.containsMouse
+                text: strings.t("gpu.advanced")
+                delay: 400
+              }
+            }
           }
 
-          Button {
-            width: parent.width
-            visible: root.apps.length > 0
-            text: strings.t("gpu.advanced")
-            fontSize: Style.font.bodySmall
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            bordered: true
-            active: root.appsAdvanced
-            onClicked: root.appsAdvanced = !root.appsAdvanced
+          DotWave {
+            visible: root.appsLoading
+            running: root.appsLoading
+            dots: 7
+            anchors.horizontalCenter: parent.horizontalCenter
+            color: root.foreground
           }
 
           Text {
             width: parent.width
-            visible: root.apps.length === 0
+            visible: root.apps.length === 0 && !root.appsLoading && root.error === ""
             textFormat: Text.PlainText
             text: strings.t("gpu.noApps")
             color: Qt.darker(root.foreground, 1.4)

@@ -107,7 +107,7 @@ Left-click the bar label (`iGPU` or `NV`) to open the panel. Right-click cycles 
 
 The panel lists connected screens and, while it is open, which apps are drawing on Intel, NVIDIA, or both, plus NVIDIA load, power, and memory. The bar itself does not call `nvidia-smi` or inspect apps, because that work stays off the polling path that would wake the discrete GPU.
 
-**Advanced** opens a Desktop, Intel, or NVIDIA choice under each app. Desktop follows the login choice. Intel or NVIDIA is remembered by the widget and applied the next time that app starts from its menu. The app that is already open keeps its current GPU until you quit it. A program with no menu entry is still remembered, and the panel says so.
+The chevron on **Apps** opens a Desktop, Intel, or NVIDIA choice under each app. A row of dots waves while that list, or the desktop GPU, is being read. Desktop follows the login choice. Intel or NVIDIA is remembered by the widget and applied the next time that app starts from its menu. The app that is already open keeps its current GPU until you quit it. A program with no menu entry is still remembered, and the panel says so.
 
 Choosing a mode writes `~/.config/uwsm/gpu-mode` and leaves the session running. When a logout would apply the new GPU, the panel shows **Log out to apply**. A second click asks **Log out now?** and then runs `omarchy system logout`, which closes your applications. Closing the panel disarms that button.
 
